@@ -21,11 +21,11 @@
 #define ENC5_B 35
 
 Encoder encoder0(ENC0_B, ENC0_A);
-Encoder encoder1(ENC1_B, ENC1_A);
+Encoder encoder1(ENC1_A, ENC1_B);
 Encoder encoder2(ENC2_B, ENC2_A);
-Encoder encoder3(ENC3_B, ENC3_A);
+Encoder encoder3(ENC3_A, ENC3_B);
 Encoder encoder4(ENC4_B, ENC4_A);
-Encoder encoder5(ENC5_B, ENC5_A);
+Encoder encoder5(ENC5_A, ENC5_B);
 
 // ----------- Motor Driver Pins ----------- //
 #define MOTOR0_PWM 4
@@ -70,19 +70,16 @@ Encoder encoder5(ENC5_B, ENC5_A);
 #define BUTTON_PIN 33
 #define DEBOUNCE_DELAY 50
 
-#define HOMING_SPEED 80       // PWM value during homing (0-255)
-#define HOMING_TIMEOUT 8000   // Max time allowed (ms)
-#define HOMING_BACKOFF 50     // How long to reverse after hitting stop
-#define STALL_CURRENT .5  // Increased sensitivity     // Amps (tune if needed)
-#define STALL_DEBOUNCE 60  // Detect stall faster    // ms to confirm it's a stall
-
 volatile bool configChangeRequested = false;
 
 // Global ROM limits for Motor Limits
 long lowROM[6]  = {-100000, -100000, -100000, -100000, -100000, -100000};
 long highROM[6] = {100000, 100000, 100000, 100000, 100000, 100000};
 
-// Defining Arrays used for homing sequence
+// ----------- Homing Sequence ----------- //
+
+#define HOMING_TIMEOUT 8000   // Max time allowed (ms)
+
 Encoder* encoders[6] = {
   &encoder0, &encoder1, &encoder2,
   &encoder3, &encoder4, &encoder5
@@ -92,6 +89,21 @@ const int motorPWM[6]   = {MOTOR0_PWM, MOTOR1_PWM, MOTOR2_PWM, MOTOR3_PWM, MOTOR
 const int motorDIR_A[6] = {MOTOR0_DIR_A, MOTOR1_DIR_A, MOTOR2_DIR_A, MOTOR3_DIR_A, MOTOR4_DIR_A, MOTOR5_DIR_A};
 const int motorDIR_B[6] = {MOTOR0_DIR_B, MOTOR1_DIR_B, MOTOR2_DIR_B, MOTOR3_DIR_B, MOTOR4_DIR_B, MOTOR5_DIR_B};
 const int motorSEN[6] = {MOTOR0_SEN, MOTOR1_SEN, MOTOR2_SEN, MOTOR3_SEN, MOTOR4_SEN, MOTOR5_SEN};
+
+// Stall current thresholds [A]
+float stallThresholds[6] = {1.2, .8, 1.2, .8, 1.2, .8};
+
+// Homing speeds [0-100] PWM will be scalled later
+const int homingSpeeds[6] = {80, 60, 80, 60, 80, 60};
+
+// Backoff durations [ms]
+const int backoffTimes[6] = {50, 70, 50, 70, 50, 70};
+
+// Pullback distances after stall [encoder counts]
+const int pullbackCounts[6] = {1000, 6000, 9000, 6000, 9000, 6000};
+
+// Stall debounce [ms] — time without motion before we consider it stuck
+const unsigned long stallDebounce[6] = {60, 80, 60, 80, 60, 80};
 
 //Joystick Variables
 const int DEADZONE = 10;
@@ -184,21 +196,26 @@ void loop() {
   controlMotor(4, processedX, lowROM[4], highROM[4]);
   controlMotor(5, processedY, lowROM[5], highROM[5]);
 
-  int raw = analogRead(motorSEN[0]);
-  float voltage = raw * (3.3 / 4095.0); 
-  float current = voltage / 0.5;  // Adjust if not using a .5 Ohm resistor
-
-
 
   static unsigned long lastPrint = 0;
   if (millis() - lastPrint >= 1000) {
     Serial.print("X: "); Serial.print(processedX); Serial.print("	Y: "); Serial.println(processedY);
     printEncoderData();
    
-    Serial.print("ADC Raw: "); Serial.print(raw);
-    Serial.print("  Voltage: "); Serial.print(voltage, 3);
-    Serial.print(" V  Current: "); Serial.print(current, 3);
-    Serial.println(" A");
+    for (int i = 0; i < 6; i++) {
+      int raw = analogRead(motorSEN[i]);
+      float voltage = raw * (3.3 / 4095.0);
+      float current = voltage / 0.5; // update if shunt value changes
+    
+      Serial.print("M"); Serial.print(i);
+      Serial.print(": ADC="); Serial.print(raw);
+      Serial.print("  I="); Serial.print(current, 3);
+      Serial.print(" A   ");
+    }
+    Serial.println();
+    
+
+    
     
     lastPrint = millis();
   }
@@ -222,6 +239,8 @@ void handleState() {
       Serial.println("State 2: Pinch Grip");
       servo0.write(90);
       servo1.write(90);
+      highROM[1]=100000;
+      lowROM[1]=-100000;
       break;
     case CONFIG_3:
       Serial.println("State 3: Claw Grip");
@@ -262,134 +281,133 @@ void printEncoderData() {
   Serial.print("Enc5: "); Serial.println(encoder5.read());
 }
 
-  void homeMotor(int index, int currentSensePin) {
-    Serial.print("Starting homing sequence for Motor ");
-    Serial.println(index);
-  
-    long prevPos = encoders[index]->read();
-    unsigned long lastMoveTime = millis();
-    unsigned long startTime = millis();
-    float alpha = 0.2;
-    float currentFiltered = 0;
-  
-    // Move to low end
-    controlMotor(index, -HOMING_SPEED, -100000, 100000);
-  
-    while (millis() - startTime < HOMING_TIMEOUT) {
-      long currPos = encoders[index]->read();
-      bool encoderMoved = (currPos != prevPos);
-      unsigned long now = millis();
-      unsigned long timeSinceMove = now - lastMoveTime;
-  
-      if (encoderMoved) {
-        lastMoveTime = now;
-        prevPos = currPos;
-      }
-  
-      int rawADC = analogRead(currentSensePin);
-      float voltage = rawADC * (3.3 / 4095.0);
-      float current = voltage / 0.5;
-      currentFiltered = alpha * current + (1 - alpha) * currentFiltered;
-  
-      bool stuck = timeSinceMove > STALL_DEBOUNCE;
-      bool overCurrent = currentFiltered > STALL_CURRENT;
-  
-      if (stuck && overCurrent) {
-        Serial.println("Low-end stall detected!");
-        break;
-      }
-  
-      delay(20);
+void homeMotor(int index, int currentSensePin) {
+  Serial.print("Starting homing sequence for Motor ");
+  Serial.println(index);
+
+  long prevPos = encoders[index]->read();
+  unsigned long lastMoveTime = millis();
+  unsigned long startTime = millis();
+  float alpha = 0.2;
+  float currentFiltered = 0;
+
+  // Move to low end (override ROM bounds)
+  controlMotor(index, -homingSpeeds[index], -100000, 100000);
+
+  while (millis() - startTime < HOMING_TIMEOUT) {
+    long currPos = encoders[index]->read();
+    bool encoderMoved = (currPos != prevPos);
+    unsigned long now = millis();
+    unsigned long timeSinceMove = now - lastMoveTime;
+
+    if (encoderMoved) {
+      lastMoveTime = now;
+      prevPos = currPos;
     }
-  
-    controlMotor(index, 0, lowROM[index], highROM[index]);
-    controlMotor(index, HOMING_SPEED / 2, -100000, 100000);
-    delay(HOMING_BACKOFF);
-    controlMotor(index, 0, lowROM[index], highROM[index]);
-    lowROM[index] = encoders[index]->read() + 9000;
-    encoders[index]->write(0);
-  
-    Serial.print("Low-end homing complete. Encoder ");
-    Serial.print(index);
-    Serial.println(" set to 0.");
-  
-    // High end
-    startTime = millis();
-    prevPos = encoders[index]->read();
-    lastMoveTime = millis();
-    controlMotor(index, HOMING_SPEED, -100000, 100000);
-  
-    while (millis() - startTime < HOMING_TIMEOUT) {
-      long currPos = encoders[index]->read();
-      bool encoderMoved = (currPos != prevPos);
-      unsigned long now = millis();
-      unsigned long timeSinceMove = now - lastMoveTime;
-  
-      if (encoderMoved) {
-        lastMoveTime = now;
-        prevPos = currPos;
-      }
-  
-      int rawADC = analogRead(currentSensePin);
-      float voltage = rawADC * (3.3 / 4095.0);
-      float current = voltage / 0.5;
-      currentFiltered = alpha * current + (1 - alpha) * currentFiltered;
-  
-      bool stuck = timeSinceMove > STALL_DEBOUNCE;
-      bool overCurrent = currentFiltered > STALL_CURRENT;
-  
-      if (stuck && overCurrent) {
-        Serial.println("High-end stall detected!");
-        break;
-      }
-  
-      delay(20);
+
+    int rawADC = analogRead(currentSensePin);
+    float voltage = rawADC * (3.3 / 4095.0);
+    float current = voltage / 0.5;
+    currentFiltered = alpha * current + (1 - alpha) * currentFiltered;
+
+    bool stuck = timeSinceMove > stallDebounce[index];
+    bool overCurrent = currentFiltered > stallThresholds[index];
+
+    if (stuck && overCurrent) {
+      Serial.println("Low-end stall detected!");
+      break;
     }
-  
-    controlMotor(index, 0, lowROM[index], highROM[index]);
-    controlMotor(index, -HOMING_SPEED / 2, lowROM[index], highROM[index]);
-    delay(HOMING_BACKOFF);
-    controlMotor(index, 0, lowROM[index], highROM[index]);
-    highROM[index] = encoders[index]->read() - 1500;
-  
-    Serial.print("High-end homing complete. Encoder ");
-    Serial.print(index);
-    Serial.print(" max position: ");
-    Serial.println(highROM[index]);
-  
-    // Midpoint move
-    long midpoint = highROM[index] / 2;
-    Serial.print("Moving to midpoint: ");
-    Serial.println(midpoint);
-  
-    unsigned long moveStart = millis();
-    long lastPos = encoders[index]->read();
-  
-    while (abs(encoders[index]->read() - midpoint) > 10 && millis() - moveStart < HOMING_TIMEOUT) {
-      long currentPos = encoders[index]->read();
-      int error = midpoint - currentPos;
-      int speed = constrain(map(abs(error), 0, highROM[index] / 2, 80, HOMING_SPEED), 70, HOMING_SPEED);
-      int direction = (error > 0) ? 1 : -1;
-      controlMotor(index, direction * speed, lowROM[index], highROM[index]);
-  
-      delay(20);
-  
-      if (abs(currentPos - lastPos) < 3) {
-        delay(200);
-        long retryPos = encoders[index]->read();
-        if (abs(retryPos - currentPos) < 3) break;
-      }
-  
-      lastPos = currentPos;
-    }
-  
-    controlMotor(index, 0, lowROM[index], highROM[index]);
-    Serial.println("Midpoint reached.");
+
+    delay(20);
   }
-  
-  void homeMotors() {
-    for (int i = 0; i < 2; i++) {
-      homeMotor(i, motorSEN[i]);
+
+  controlMotor(index, 0, lowROM[index], highROM[index]);
+  controlMotor(index, homingSpeeds[index] / 2, -100000, 100000);
+  delay(backoffTimes[index]);
+  controlMotor(index, 0, lowROM[index], highROM[index]);
+  lowROM[index] = encoders[index]->read() + pullbackCounts[index];
+  encoders[index]->write(0);
+
+  Serial.print("Low-end homing complete. Encoder ");
+  Serial.print(index);
+  Serial.println(" set to 0.");
+
+  // Move to high end
+  startTime = millis();
+  prevPos = encoders[index]->read();
+  lastMoveTime = millis();
+  controlMotor(index, homingSpeeds[index], -100000, 100000);
+
+  while (millis() - startTime < HOMING_TIMEOUT) {
+    long currPos = encoders[index]->read();
+    bool encoderMoved = (currPos != prevPos);
+    unsigned long now = millis();
+    unsigned long timeSinceMove = now - lastMoveTime;
+
+    if (encoderMoved) {
+      lastMoveTime = now;
+      prevPos = currPos;
     }
+
+    int rawADC = analogRead(currentSensePin);
+    float voltage = rawADC * (3.3 / 4095.0);
+    float current = voltage / 0.5;
+    currentFiltered = alpha * current + (1 - alpha) * currentFiltered;
+
+    bool stuck = timeSinceMove > stallDebounce[index];
+    bool overCurrent = currentFiltered > stallThresholds[index];
+
+    if (stuck && overCurrent) {
+      Serial.println("High-end stall detected!");
+      break;
+    }
+
+    delay(20);
   }
-  
+
+  controlMotor(index, 0, lowROM[index], highROM[index]);
+  controlMotor(index, -homingSpeeds[index] / 2, lowROM[index], highROM[index]);
+  delay(backoffTimes[index]);
+  controlMotor(index, 0, lowROM[index], highROM[index]);
+  highROM[index] = encoders[index]->read() - pullbackCounts[index];
+
+  Serial.print("High-end homing complete. Encoder ");
+  Serial.print(index);
+  Serial.print(" max position: ");
+  Serial.println(highROM[index]);
+
+  // Move to midpoint
+  long midpoint = highROM[index] / 2;
+  Serial.print("Moving to midpoint: ");
+  Serial.println(midpoint);
+
+  unsigned long moveStart = millis();
+  long lastPos = encoders[index]->read();
+
+  while (abs(encoders[index]->read() - midpoint) > 10 && millis() - moveStart < HOMING_TIMEOUT) {
+    long currentPos = encoders[index]->read();
+    int error = midpoint - currentPos;
+    int speed = constrain(map(abs(error), 0, highROM[index] / 2, 100, homingSpeeds[index]), 100, homingSpeeds[index]);
+    int direction = (error > 0) ? 1 : -1;
+    controlMotor(index, direction * speed, lowROM[index], highROM[index]);
+
+    delay(20);
+
+    if (abs(currentPos - lastPos) < 3) {
+      delay(200);
+      long retryPos = encoders[index]->read();
+      if (abs(retryPos - currentPos) < 3) break;
+    }
+
+    lastPos = currentPos;
+  }
+
+  controlMotor(index, 0, lowROM[index], highROM[index]);
+  Serial.println("Midpoint reached.");
+}
+
+void homeMotors() {
+  for (int i = 0; i < 2; i++) {
+    homeMotor(i, motorSEN[i]);
+  }
+}
