@@ -1,10 +1,10 @@
-// Version: 2025-04-18
-// Description: Initial PlatformIO version — Motor 0 homing + joystick drive + servo configs
-
+// Version: 2025-07-20
+// Description: Updated for CAN-based control — joystick + button data now received over CAN
 
 #include <PWMServo.h>
 #include <Arduino.h>
 #include <Encoder.h>
+#include <FlexCAN_T4.h>
 
 // ----------- Encoder Pins (Hardware Quadrature) ----------- //
 #define ENC0_A 0
@@ -31,23 +31,18 @@ Encoder encoder5(ENC5_A, ENC5_B);
 #define MOTOR0_PWM 4
 #define MOTOR0_DIR_A 25
 #define MOTOR0_DIR_B 26
-
 #define MOTOR1_PWM 5
 #define MOTOR1_DIR_A 27
-#define MOTOR1_DIR_B 30
-
+#define MOTOR1_DIR_B 15
 #define MOTOR2_PWM 10
-#define MOTOR2_DIR_A 31
+#define MOTOR2_DIR_A 14
 #define MOTOR2_DIR_B 32
-
 #define MOTOR3_PWM 11
 #define MOTOR3_DIR_A 13
 #define MOTOR3_DIR_B 41
-
 #define MOTOR4_PWM 12
 #define MOTOR4_DIR_A 39
 #define MOTOR4_DIR_B 40
-
 #define MOTOR5_PWM 24
 #define MOTOR5_DIR_A 37
 #define MOTOR5_DIR_B 38
@@ -55,46 +50,36 @@ Encoder encoder5(ENC5_A, ENC5_B);
 // ----------- Current Sense Pins ----------- //
 #define MOTOR0_SEN 16
 #define MOTOR1_SEN 17
-#define MOTOR2_SEN 18 
-#define MOTOR3_SEN 19 
-#define MOTOR4_SEN 20 
-#define MOTOR5_SEN 21  
+#define MOTOR2_SEN 18
+#define MOTOR3_SEN 19
+#define MOTOR4_SEN 20
+#define MOTOR5_SEN 21
 
 // ----------- Servo Pins ----------- //
 #define SERVO0 28
 #define SERVO1 29
 
-// ----------- Joystick and Button ----------- //
-#define JOYSTICK_X A0
-#define JOYSTICK_Y A1
-#define BUTTON_PIN 33
-#define DEBOUNCE_DELAY 50
+// ----------- CAN Declaration ----------- //
+FlexCAN_T4<CAN3, RX_SIZE_256, TX_SIZE_16> Can3;
 
 volatile bool configChangeRequested = false;
 
-// Global ROM limits for Motor Limits
+// ----------- Global ROM limits for Motor Limits ----------- //
 long lowROM[6]  = {-100000, -100000, -100000, -100000, -100000, -100000};
 long highROM[6] = {100000, 100000, 100000, 100000, 100000, 100000};
 
-// ----------- Homing Sequence ----------- //
-
-#define HOMING_TIMEOUT 8000   // Max time allowed (ms)
-
-Encoder* encoders[6] = {
-  &encoder0, &encoder1, &encoder2,
-  &encoder3, &encoder4, &encoder5
-};
-
+#define HOMING_TIMEOUT 8000
+Encoder* encoders[6] = { &encoder0, &encoder1, &encoder2, &encoder3, &encoder4, &encoder5 };
 const int motorPWM[6]   = {MOTOR0_PWM, MOTOR1_PWM, MOTOR2_PWM, MOTOR3_PWM, MOTOR4_PWM, MOTOR5_PWM};
 const int motorDIR_A[6] = {MOTOR0_DIR_A, MOTOR1_DIR_A, MOTOR2_DIR_A, MOTOR3_DIR_A, MOTOR4_DIR_A, MOTOR5_DIR_A};
 const int motorDIR_B[6] = {MOTOR0_DIR_B, MOTOR1_DIR_B, MOTOR2_DIR_B, MOTOR3_DIR_B, MOTOR4_DIR_B, MOTOR5_DIR_B};
-const int motorSEN[6] = {MOTOR0_SEN, MOTOR1_SEN, MOTOR2_SEN, MOTOR3_SEN, MOTOR4_SEN, MOTOR5_SEN};
+const int motorSEN[6]   = {MOTOR0_SEN, MOTOR1_SEN, MOTOR2_SEN, MOTOR3_SEN, MOTOR4_SEN, MOTOR5_SEN};
 
 // Stall current thresholds [A]
-float stallThresholds[6] = {.6, .6, .6, .6, .6, .6};
+float stallThresholds[6] = {.3, .3, .3, .3, .3, .3};
 
 // Homing speeds [0-100] PWM will be scalled later
-const int homingSpeeds[6] = {80, 80, 80, 80, 80, 80};
+const int homingSpeeds[6] = {100, 80, 100, 80, 100, 80};
 
 // Backoff durations [ms]
 const int backoffTimes[6] = {50, 100, 50, 100, 50, 100};
@@ -105,40 +90,25 @@ const int pullbackCounts[6] = {10, 10, 10, 10, 10, 10};
 // Stall debounce [ms] — time without motion before we consider it stuck
 const unsigned long stallDebounce[6] = {60, 80, 60, 80, 60, 80};
 
-//Joystick Variables
-const int DEADZONE = 10;
-const int MAX_INPUT = 4095;
-const int MID_POINT = 2047;
-
 int processedX = 0;
 int processedY = 0;
 
-//Declaration for finger configurations driven by servos
-enum HandState {
-  CONFIG_1,
-  CONFIG_2,
-  CONFIG_3,
-  CONFIG_4
-};
-
-HandState currentState = CONFIG_1;
-bool buttonState = false;
-bool lastButtonState = false;
-unsigned long lastDebounceTime = 0;
-
 PWMServo servo0;
+PWMServo servo1;
 
-// Forward declarations
-void controlMotor(int index, int speed, long lowROM, long highROM);
-
+// Function declarations 
 void homeMotors();
-
 void nextState();
 void handleState();
 void printEncoderData();
 void printAllROMs();
+void controlMotor(int index, int speed, long lowROM, long highROM);
 
-PWMServo servo1;
+
+//Declaration for finger configurations driven by servos
+enum HandState { CONFIG_1, CONFIG_2, CONFIG_3, CONFIG_4 };
+HandState currentState = CONFIG_1;
+uint16_t lastButtonCounter = 0;
 
 void configChangeISR() {
   configChangeRequested = true;
@@ -148,47 +118,55 @@ float lerp(float x, float x1, float x2, float y1, float y2) {
   return y1 + ((x - x1) / (x2 - x1)) * (y2 - y1);
 }
 
+void handleCAN(const CAN_message_t &msg) {
+  if (msg.id == 0x100 && msg.len == 6) {
+    int joyX = ((int)msg.buf[0] << 8) | msg.buf[1];
+    int joyY = ((int)msg.buf[2] << 8) | msg.buf[3];
+    uint16_t buttonCounter = ((uint16_t)msg.buf[4] << 8) | msg.buf[5];
+
+    processedX = (int)lerp((float)joyX, 0.0, 4095.0, -100.0, 100.0);
+    processedY = (int)lerp((float)joyY, 0.0, 4095.0, -100.0, 100.0);
+
+    processedX = abs(processedX) > 10 ? processedX : 0;
+    processedY = abs(processedY) > 10 ? processedY : 0;
+
+    if (buttonCounter != lastButtonCounter) {
+      configChangeRequested = true;
+      lastButtonCounter = buttonCounter;
+    }
+  }
+}
+
 void setup() {
+  Serial.begin(115200);
   analogReadResolution(12);
 
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  pinMode(JOYSTICK_X, INPUT);
-  pinMode(JOYSTICK_Y, INPUT);
-
-  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), configChangeISR, FALLING);
-
-  int motorPins[] = {
-    MOTOR0_PWM, MOTOR0_DIR_A, MOTOR0_DIR_B, MOTOR1_PWM, MOTOR1_DIR_A, MOTOR1_DIR_B,
-    MOTOR2_PWM, MOTOR2_DIR_A, MOTOR2_DIR_B, MOTOR3_PWM, MOTOR3_DIR_A, MOTOR3_DIR_B,
-    MOTOR4_PWM, MOTOR4_DIR_A, MOTOR4_DIR_B, MOTOR5_PWM, MOTOR5_DIR_A, MOTOR5_DIR_B
-  };
-  for (size_t i = 0; i < sizeof(motorPins)/sizeof(motorPins[0]); i++) {
-    pinMode(motorPins[i], OUTPUT);
+  for (int i = 0; i < 6; i++) {
+    pinMode(motorPWM[i], OUTPUT);
+    pinMode(motorDIR_A[i], OUTPUT);
+    pinMode(motorDIR_B[i], OUTPUT);
   }
 
   servo0.attach(SERVO0);
   servo1.attach(SERVO1);
 
-  Serial.println("System Initialized");
+  Can3.begin();
+  Can3.setBaudRate(500000);
+  Can3.enableMBInterrupts();
+  Can3.onReceive(handleCAN);
 
+  Serial.println("System Initialized (CAN-based)");
   homeMotors();
   handleState();
 }
 
 void loop() {
+  Can3.events();
 
   if (configChangeRequested) {
     configChangeRequested = false;
     nextState();  
   }
-
-  int rawX = analogRead(JOYSTICK_X);
-  int rawY = analogRead(JOYSTICK_Y);
-  processedX = (int)lerp((float)rawX, 0.0, MAX_INPUT, -100.0, 100.0);
-  processedY = (int)lerp((float)rawY, 0.0, MAX_INPUT, -100.0, 100.0);
-
-  processedX = abs(processedX) > DEADZONE ? processedX : 0;
-  processedY = abs(processedY) > DEADZONE ? processedY : 0;
 
   controlMotor(0, processedX, lowROM[0], highROM[0]);
   controlMotor(1, processedY, lowROM[1], highROM[1]);
@@ -197,30 +175,26 @@ void loop() {
   controlMotor(4, processedX, lowROM[4], highROM[4]);
   controlMotor(5, processedY, lowROM[5], highROM[5]);
 
-
   static unsigned long lastPrint = 0;
   if (millis() - lastPrint >= 1000) {
-    Serial.print("X: "); Serial.print(processedX); Serial.print("	Y: "); Serial.println(processedY);
+    Serial.print("X: "); Serial.print(processedX); Serial.print("\tY: "); Serial.println(processedY);
     printEncoderData();
-   
+
     for (int i = 0; i < 6; i++) {
       int raw = analogRead(motorSEN[i]);
       float voltage = raw * (3.3 / 4095.0);
-      float current = voltage / 0.5; // update if shunt value changes
-    
+      float current = voltage / 0.5;
       Serial.print("M"); Serial.print(i);
       Serial.print(": ADC="); Serial.print(raw);
       Serial.print("  I="); Serial.print(current, 3);
       Serial.print(" A   ");
     }
     Serial.println();
-    
-
-    
-    
     lastPrint = millis();
   }
 }
+
+// Remaining functions retained below
 
 void nextState() {
   currentState = static_cast<HandState>((currentState + 1) % 4);
@@ -233,8 +207,8 @@ void handleState() {
   switch (currentState) {
     case CONFIG_1:
       Serial.println("State 1: One-sided Grip");
-      servo0.write(180);
-      servo1.write(0);
+      servo0.write(160);
+      servo1.write(20);
       break;
     case CONFIG_2:
       Serial.println("State 2: Pinch Grip");
@@ -248,8 +222,8 @@ void handleState() {
       break;
     case CONFIG_4:
       Serial.println("State 4: Coffee Cup Grip");
-      servo0.write(0);
-      servo1.write(180);
+      servo0.write(15);
+      servo1.write(160);
       break;
   }
 }
@@ -257,7 +231,7 @@ void handleState() {
 void controlMotor(int index, int speed, long lowROM, long highROM) {
   long pos = encoders[index]->read();
   float normalizedPos = (float)(pos - lowROM) / (highROM - lowROM);
-  float target = (float)speed / 100.0; // normalize input to -1.0 to 1.0
+  float target = (float)speed / 100.0;
 
   if ((target > 0 && normalizedPos >= 1.0) || (target < 0 && normalizedPos <= 0.0)) {
     analogWrite(motorPWM[index], 0);
@@ -270,13 +244,12 @@ void controlMotor(int index, int speed, long lowROM, long highROM) {
   analogWrite(motorPWM[index], pwmValue);
 }
 
-
 void printEncoderData() {
-  Serial.print("Enc0: "); Serial.print(encoder0.read()); Serial.print("\t");
-  Serial.print("Enc1: "); Serial.print(encoder1.read()); Serial.print("\t");
-  Serial.print("Enc2: "); Serial.print(encoder2.read()); Serial.print("\t");
-  Serial.print("Enc3: "); Serial.print(encoder3.read()); Serial.print("\t");
-  Serial.print("Enc4: "); Serial.print(encoder4.read()); Serial.print("\t");
+  Serial.print("Enc0: "); Serial.print(encoder0.read()); Serial.print("	");
+  Serial.print("Enc1: "); Serial.print(encoder1.read()); Serial.print("	");
+  Serial.print("Enc2: "); Serial.print(encoder2.read()); Serial.print("	");
+  Serial.print("Enc3: "); Serial.print(encoder3.read()); Serial.print("	");
+  Serial.print("Enc4: "); Serial.print(encoder4.read()); Serial.print("	");
   Serial.print("Enc5: "); Serial.println(encoder5.read());
 }
 
@@ -292,10 +265,9 @@ void homeMotor(int index, int currentSensePin) {
   float alpha = 0.2;
   float currentFiltered = 0;
 
-  // -------- Move to low-end stop -------- //
   controlMotor(index, -homingSpeeds[index], -100000, 100000);
-
   Serial.println("[Low-end Homing Phase]");
+
   while (millis() - startTime < HOMING_TIMEOUT) {
     long currPos = encoders[index]->read();
     bool encoderMoved = (currPos != prevPos);
@@ -315,28 +287,13 @@ void homeMotor(int index, int currentSensePin) {
     bool stuck = timeSinceMove > stallDebounce[index];
     bool overCurrent = currentFiltered > stallThresholds[index];
 
-    Serial.print("Motor ");
-    Serial.print(index);
-    Serial.print(" | Pos: ");
-    Serial.print(currPos);
-    Serial.print(" | Δt: ");
-    Serial.print(timeSinceMove);
-    Serial.print(" ms | Current: ");
-    Serial.print(currentFiltered, 3);
-    Serial.print(" A | OverCurrent: ");
-    Serial.print(overCurrent);
-    Serial.print(" | Stuck: ");
-    Serial.println(stuck);
-
     if (stuck && overCurrent) {
       Serial.println("Low-end stall detected!");
       break;
     }
-
     delay(20);
   }
 
-  // Stop and back off slightly
   controlMotor(index, 0, lowROM[index], highROM[index]);
   controlMotor(index, 100, -100000, 100000);
   delay(backoffTimes[index]);
@@ -347,13 +304,12 @@ void homeMotor(int index, int currentSensePin) {
   Serial.print("Set lowROM["); Serial.print(index); Serial.print("]: ");
   Serial.println(lowROM[index]);
 
-  // -------- Move to high-end stop -------- //
   startTime = millis();
   prevPos = encoders[index]->read();
   lastMoveTime = millis();
   controlMotor(index, homingSpeeds[index], -100000, 100000);
-
   Serial.println("[High-end Homing Phase]");
+
   while (millis() - startTime < HOMING_TIMEOUT) {
     long currPos = encoders[index]->read();
     bool encoderMoved = (currPos != prevPos);
@@ -373,28 +329,13 @@ void homeMotor(int index, int currentSensePin) {
     bool stuck = timeSinceMove > stallDebounce[index];
     bool overCurrent = currentFiltered > stallThresholds[index];
 
-    Serial.print("Motor ");
-    Serial.print(index);
-    Serial.print(" | Pos: ");
-    Serial.print(currPos);
-    Serial.print(" | Δt: ");
-    Serial.print(timeSinceMove);
-    Serial.print(" ms | Current: ");
-    Serial.print(currentFiltered, 3);
-    Serial.print(" A | OverCurrent: ");
-    Serial.print(overCurrent);
-    Serial.print(" | Stuck: ");
-    Serial.println(stuck);
-
     if (stuck && overCurrent) {
       Serial.println("High-end stall detected!");
       break;
     }
-
     delay(20);
   }
 
-  // Stop and back off slightly
   controlMotor(index, 0, lowROM[index], highROM[index]);
   controlMotor(index, -100, lowROM[index], highROM[index]);
   delay(backoffTimes[index]);
@@ -404,13 +345,10 @@ void homeMotor(int index, int currentSensePin) {
   Serial.print("Set highROM["); Serial.print(index); Serial.print("]: ");
   Serial.println(highROM[index]);
 
-  // -------- Move to midpoint -------- //
   long midpoint = (lowROM[index] + highROM[index]) / 2;
   long range = highROM[index] - lowROM[index];
-  Serial.print("Calculated midpoint: ");
-  Serial.println(midpoint);
-  Serial.print("ROM Range: ");
-  Serial.println(range);
+  Serial.print("Calculated midpoint: "); Serial.println(midpoint);
+  Serial.print("ROM Range: "); Serial.println(range);
 
   if (range < 500) {
     Serial.println("Warning: ROM range too small, skipping midpoint move!");
@@ -419,25 +357,15 @@ void homeMotor(int index, int currentSensePin) {
 
   startTime = millis();
   long lastPos = encoders[index]->read();
-
   Serial.println("[Midpoint Move Phase]");
+
   while (abs(encoders[index]->read() - midpoint) > 10 && millis() - startTime < HOMING_TIMEOUT) {
     long currentPos = encoders[index]->read();
     int error = midpoint - currentPos;
     int speed = constrain(map(abs(error), 0, range / 2, 80, homingSpeeds[index]), 70, homingSpeeds[index]);
     int direction = (error > 0) ? 1 : -1;
-
     controlMotor(index, direction * speed, lowROM[index], highROM[index]);
     delay(20);
-
-    Serial.print("Moving to midpoint | Pos: ");
-    Serial.print(currentPos);
-    Serial.print(" | Target: ");
-    Serial.print(midpoint);
-    Serial.print(" | Error: ");
-    Serial.print(error);
-    Serial.print(" | Speed: ");
-    Serial.println(direction * speed);
 
     if (abs(currentPos - lastPos) < 3) {
       delay(200);
@@ -447,26 +375,22 @@ void homeMotor(int index, int currentSensePin) {
         break;
       }
     }
-
     lastPos = currentPos;
   }
-
   controlMotor(index, 0, lowROM[index], highROM[index]);
   Serial.println("Midpoint reached successfully.");
-
   Serial.print("==== Finished homing motor ");
   Serial.print(index);
   Serial.println(" ====");
 }
 
-
-
 void homeMotors() {
-  for (int i = 0; i < 6; i++) {
+  for (int i = 0; i < 0; i++) {
     homeMotor(i, motorSEN[i]);
   }
   printAllROMs();
 }
+
 void printAllROMs() {
   Serial.println();
   Serial.println("==== Motor ROM Summary ====");
