@@ -97,6 +97,7 @@ PWMServo servo0;
 PWMServo servo1;
 
 // Function declarations 
+void sendEncoderPositions();
 void homeMotors();
 void nextState();
 void handleState();
@@ -124,8 +125,8 @@ void handleCAN(const CAN_message_t &msg) {
     int joyY = ((int)msg.buf[2] << 8) | msg.buf[3];
     uint16_t buttonCounter = ((uint16_t)msg.buf[4] << 8) | msg.buf[5];
 
-    processedX = (int)lerp((float)joyX, 0.0, 4095.0, -100.0, 100.0);
-    processedY = (int)lerp((float)joyY, 0.0, 4095.0, -100.0, 100.0);
+    processedX = (int)lerp((float)joyX, 0.0, 1023.0, -100.0, 100.0);
+    processedY = (int)lerp((float)joyY, 0.0, 1023.0, -100.0, 100.0);
 
     processedX = abs(processedX) > 10 ? processedX : 0;
     processedY = abs(processedY) > 10 ? processedY : 0;
@@ -161,6 +162,7 @@ void setup() {
 }
 
 void loop() {
+  sendEncoderPositions();
   Can3.events();
 
   if (configChangeRequested) {
@@ -389,6 +391,22 @@ void homeMotors() {
     homeMotor(i, motorSEN[i]);
   }
   printAllROMs();
+}
+
+void sendEncoderPositions() {
+  for (int i = 0; i < 6; i++) {
+    CAN_message_t msg;
+    msg.id = 0x110 + i;
+    msg.len = 4;
+    long pos = encoders[i]->read();
+
+    msg.buf[0] = (pos >> 24) & 0xFF;
+    msg.buf[1] = (pos >> 16) & 0xFF;
+    msg.buf[2] = (pos >> 8) & 0xFF;
+    msg.buf[3] = pos & 0xFF;
+
+    Can3.write(msg);
+  }
 }
 
 void printAllROMs() {
