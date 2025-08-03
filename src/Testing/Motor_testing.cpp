@@ -173,12 +173,25 @@ void loop() {
     nextState();  
   }
 
-  controlMotor(0, processedX, lowROM[0], highROM[0]);
-  controlMotor(1, processedY, lowROM[1], highROM[1]);
-  controlMotor(2, processedX, lowROM[2], highROM[2]);
-  controlMotor(3, processedY, lowROM[3], highROM[3]);
-  controlMotor(4, processedX, lowROM[4], highROM[4]);
-  controlMotor(5, processedY, lowROM[5], highROM[5]);
+  switch (currentState) {
+    case CONFIG_1:
+      for (int i = 0; i < 6; i++) {
+        controlMotor(i, (i % 2 == 0) ? processedX : processedY, lowROM[i], highROM[i]);
+      }
+      break;
+    case CONFIG_2:
+      controlMotor(0, processedX, lowROM[0], highROM[0]);
+      controlMotor(1, processedY, lowROM[1], highROM[1]);
+      break;
+    case CONFIG_3:
+      controlMotor(2, processedX, lowROM[2], highROM[2]);
+      controlMotor(3, processedY, lowROM[3], highROM[3]);
+      break;
+    case CONFIG_4:
+      controlMotor(4, processedX, lowROM[4], highROM[4]);
+      controlMotor(5, processedY, lowROM[5], highROM[5]);
+      break;
+  }
 
   static unsigned long lastPrint = 0;
   if (millis() - lastPrint >= 1000) {

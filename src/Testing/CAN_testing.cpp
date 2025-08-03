@@ -5,9 +5,11 @@ FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can0;
 const int JOY_X_PIN = 14;  // A0
 const int JOY_Y_PIN = 15;  // A1
 const int BUTTON_PIN = 33; // Digital input
+const int HOME_BUTTON_PIN = 32; // Button for homing
 
 int buttonCounter = 0;
 bool lastButtonState = false;
+bool lastHomeButtonState = false;
 
 int32_t encoderPositions[6] = {0};  // Stores positions for encoders 0 to 5
 
@@ -36,6 +38,7 @@ void setup() {
   Can0.onReceive(handleCAN);
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(HOME_BUTTON_PIN, INPUT_PULLUP);
 
   Serial.println("CAN transmitter and encoder listener ready");
 }
@@ -44,6 +47,7 @@ void loop() {
   int joyX = 1023 - analogRead(JOY_X_PIN);
   int joyY = analogRead(JOY_Y_PIN);
   bool currentButtonState = !digitalRead(BUTTON_PIN);
+  bool currentHomeButtonState = !digitalRead(HOME_BUTTON_PIN);
 
   if (currentButtonState && !lastButtonState) {
     buttonCounter++;
@@ -61,6 +65,17 @@ void loop() {
   msg.buf[5] = buttonCounter & 0xFF;
 
   Can0.write(msg);
+
+  // Send homing request if home button is pressed
+  if (currentHomeButtonState && !lastHomeButtonState) {
+    CAN_message_t homeMsg;
+    homeMsg.id = 0x120;  // Unique ID for homing command
+    homeMsg.len = 1;
+    homeMsg.buf[0] = 1;
+    Can0.write(homeMsg);
+    Serial.println("Sent homing request");
+  }
+  lastHomeButtonState = currentHomeButtonState;
 
   unsigned long now = millis();
   if (now - lastPrintTime >= printInterval) {
