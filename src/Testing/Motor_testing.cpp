@@ -22,10 +22,10 @@
 
 Encoder encoder0(ENC0_A, ENC0_B);
 Encoder encoder1(ENC1_A, ENC1_B);
-Encoder encoder2(ENC2_A, ENC2_B);
-Encoder encoder3(ENC3_A, ENC3_B);
-Encoder encoder4(ENC4_A, ENC4_B);
-Encoder encoder5(ENC5_A, ENC5_B);
+Encoder encoder4(ENC2_A, ENC2_B);
+Encoder encoder5(ENC3_A, ENC3_B);
+Encoder encoder2(ENC4_A, ENC4_B);
+Encoder encoder3(ENC5_B, ENC5_A);
 
 // ----------- Motor Driver Pins ----------- //
 #define MOTOR0_PWM 4
