@@ -1,10 +1,14 @@
 // Version: 2025-07-20
 // Description: Updated for CAN-based control — joystick + button data now received over CAN
+// Update (2025-12-13): Migrated motor PWM outputs to Teensy_PWM (khoih-prog)
+// Update (2025-12-19): vREF migrated BACK to Teensy_PWM for unified PWM control
+// Update (2025-12-19): REMOVED nFAULT ISR + related globals/prints for debug isolation
 
-#include <PWMServo.h>
+// #include <PWMServo.h>  // TEMP DISABLED for PWM timer conflict testing
 #include <Arduino.h>
 #include <Encoder.h>
 #include <FlexCAN_T4.h>
+#include <Teensy_PWM.h>
 
 // ----------- CAN Message Map ----------- //
 
@@ -17,7 +21,6 @@ constexpr uint32_t CAN_ID_PWM_B_CMD       = 0x201;  // PWM_B[0..5]
 // Hand -> Brain
 constexpr uint32_t CAN_ID_ENCODER_BASE    = 0x110;  // + motor index
 constexpr uint32_t CAN_ID_ROM_BASE        = 0x130;  // + motor index
-
 
 // ----------- Encoder Pins (Hardware Quadrature) ----------- //
 #define ENC0_A 0
@@ -76,176 +79,220 @@ FlexCAN_T4<CAN3, RX_SIZE_256, TX_SIZE_16> Can3;
 
 volatile uint8_t requestedConfig = 0;
 volatile bool configChangeRequested = false;
-volatile bool nFaultFlag = false;
 
-
+// Homing request flag (set by CAN, executed in loop)
+volatile bool homingRequested = false;
+volatile uint8_t homingIndexRequested = 0;
 
 // ----------- Global ROM limits for Motor Limits ----------- //
 long lowROM[6]  = {-100000, -100000, -100000, -100000, -100000, -100000};
 long highROM[6] = {100000, 100000, 100000, 100000, 100000, 100000};
 
 // Homing timeouts [ms]
-const unsigned long HOMING_HIGH_TIMEOUT_MS = 5000;  // high end search
-const unsigned long HOMING_LOW_TIMEOUT_MS  = 5000;  // low end search
+const unsigned long HOMING_HIGH_TIMEOUT_MS = 1000;  // high end search
+const unsigned long HOMING_LOW_TIMEOUT_MS  = 1000;  // low end search
 
 Encoder* encoders[6] = { &encoder0, &encoder1, &encoder2, &encoder3, &encoder4, &encoder5 };
-const int motorPWM_A[6]   = {MOTOR0_PWM_A, MOTOR1_PWM_A, MOTOR2_PWM_A, MOTOR3_PWM_A, MOTOR4_PWM_A, MOTOR5_PWM_A};
-const int motorPWM_B[6]   = {MOTOR0_PWM_B, MOTOR1_PWM_B, MOTOR2_PWM_B, MOTOR3_PWM_B, MOTOR4_PWM_B, MOTOR5_PWM_B};
+const int motorPWM_A[6] = {MOTOR0_PWM_A, MOTOR1_PWM_A, MOTOR2_PWM_A, MOTOR3_PWM_A, MOTOR4_PWM_A, MOTOR5_PWM_A};
+const int motorPWM_B[6] = {MOTOR0_PWM_B, MOTOR1_PWM_B, MOTOR2_PWM_B, MOTOR3_PWM_B, MOTOR4_PWM_B, MOTOR5_PWM_B};
 const int motorSEN[6]   = {MOTOR0_SEN, MOTOR1_SEN, MOTOR2_SEN, MOTOR3_SEN, MOTOR4_SEN, MOTOR5_SEN};
-int PWM_A[6] = {0, 0, 0, 0, 0, 0};
-int PWM_B[6] = {0, 0, 0, 0, 0, 0};
 
+// Incoming commands from brain (0..255 like old analogWrite)
+uint8_t PWM_A[6] = {0, 0, 0, 0, 0, 0};
+uint8_t PWM_B[6] = {0, 0, 0, 0, 0, 0};
 
+// Last-applied PWM values (so we only touch hardware when something changes)
+uint8_t lastPWM_A[6] = {0, 0, 0, 0, 0, 0};
+uint8_t lastPWM_B[6] = {0, 0, 0, 0, 0, 0};
+
+// Last-applied vREF duty byte
+uint8_t lastVrefDuty = 0;
 
 // Homing vREF voltage [PWM]
-const int homingVoltage[6] = {127, 127, 127, 127, 127, 127};
+const int homingVoltage[6] = {50, 127, 127, 127, 127, 127};
 
-// Homing speeds [0-100] PWM will be scalled later
-const int homingSpeeds[6] = {100, 80, 100, 80, 100, 80};
+// Normal (full-scale) vREF duty for regular operation
+const int NORMAL_VREF_DUTY = 50;  // 100% duty (0..255)
+
+// Homing speeds [0-100] P will be scaled later
+const int homingSpeeds[6] = {90, 50, 50, 50, 50, 50};
 
 // Pullback distances after stall [encoder counts]
 const int pullbackCounts[6] = {10, 10, 10, 10, 10, 10};
 
+// PWMServo servo0;  // TEMP DISABLED for PWM timer conflict testing
 
-PWMServo servo0;
+// =============================
+// Teensy_PWM setup
+// =============================
+constexpr float MOTOR_PWM_FREQ_HZ = 20000.0f; // 20 kHz recommended for DRV8874
+constexpr float VREF_PWM_FREQ_HZ  = 20000.0f; // keep vREF on same freq unless you have a reason not to
 
-// Function declarations 
+// One Teensy_PWM object per motor PWM pin
+Teensy_PWM* motorPwmA[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+Teensy_PWM* motorPwmB[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+
+// vREF PWM object
+Teensy_PWM* vrefPwm = nullptr;
+
+// ----------- Function declarations -----------
+void handleCAN(const CAN_message_t &msg);
 void sendEncoderPositions();
 void sendRangeOfMotion();
 void nextState();
 void handleState();
 void printEncoderData();
+void printMotorDiagnostics();
 void controlMotor(int index);
 void homeMotor(int index);
 void stopMotor(int index);
 void driveMotorHoming(int index, int direction);
 
-static void loadPwmArray(int *target, const CAN_message_t &msg);
+static void loadPwmArray(uint8_t *target, const CAN_message_t &msg);
 
-// ISR declarations
-void onNFaultISR();
+// ----------- Helper forward declarations -----------
+static inline uint16_t dutyByteToLevel16(uint8_t dutyByte);
+static inline void setMotorDutyByte(Teensy_PWM* pwm, uint8_t dutyByte);
+void setVrefDuty(int dutyByte);
 
-//Declaration for finger configurations driven by servos
+// Declaration for finger configurations driven by servos
 enum HandState { CONFIG_1, CONFIG_2, CONFIG_3, CONFIG_4 };
 HandState currentState = CONFIG_1;
-
-void handleCAN(const CAN_message_t &msg) {
-  switch (msg.id) {
-    case CAN_ID_PWM_A_CMD: {
-      // Brain is sending PWM_A[0..5]
-      if (msg.len >= 6) {
-        loadPwmArray(PWM_A, msg);
-      }
-      break;
-    }
-
-    case CAN_ID_PWM_B_CMD: {
-      // Brain is sending PWM_B[0..5]
-      if (msg.len >= 6) {
-        loadPwmArray(PWM_B, msg);
-      }
-      break;
-    }
-
-    case CAN_ID_CONFIG_CMD: {
-      // Hand state / config command from brain
-      // msg.buf[0] = desired config ID (0,1,2,3,...)
-      if (msg.len >= 1) {
-        requestedConfig = msg.buf[0];
-        configChangeRequested = true;  // main loop will act on requestedConfig
-      }
-      break;
-    }
-
-
-    case CAN_ID_HOMING_CMD: {
-      // Homing request
-      if (msg.len == 1 && msg.buf[0] == 1) {
-        Serial.println("Homing request received via CAN");
-        //homeMotors();
-      }
-      break;
-    }
-
-    default:
-      // Ignore other IDs for now
-      break;
-  }
-}
-
 
 void setup() {
   Serial.begin(115200);
   analogReadResolution(12);
 
-  for (int i = 0; i < 6; i++) {
-  pinMode(motorPWM_A[i], OUTPUT);
-  pinMode(motorPWM_B[i], OUTPUT);
-}
+  noInterrupts();
 
-  pinMode(PMODE, OUTPUT); 
+  // Motor PWM pins
+  for (int i = 0; i < 6; i++) {
+    pinMode(motorPWM_A[i], OUTPUT);
+    pinMode(motorPWM_B[i], OUTPUT);
+  }
+
+  pinMode(PMODE, OUTPUT);
   pinMode(vREF, OUTPUT);
-  pinMode(nFAULT, INPUT);
+  pinMode(nFAULT, INPUT_PULLUP);   // external pull-up
   pinMode(nSLEEP, OUTPUT);
 
-  servo0.attach(SERVO0);
+  // ------------------------------
+  // Initialize Teensy_PWM outputs (motors)
+  // ------------------------------
+  for (int i = 0; i < 6; i++) {
+    motorPwmA[i] = new Teensy_PWM(motorPWM_A[i], MOTOR_PWM_FREQ_HZ, 0.0f);
+    motorPwmB[i] = new Teensy_PWM(motorPWM_B[i], MOTOR_PWM_FREQ_HZ, 0.0f);
+
+    if (!motorPwmA[i] || !motorPwmB[i]) {
+      Serial.println("PWM allocation failed!");
+      while (1) {}
+    }
+
+    motorPwmA[i]->setPWM();
+    motorPwmB[i]->setPWM();
+  }
+
+  // ------------------------------
+  // Initialize Teensy_PWM output (vREF)
+  // ------------------------------
+  // NOTE: Teensy_PWM takes dutyCycle in percent for the constructor.
+  vrefPwm = new Teensy_PWM(vREF, VREF_PWM_FREQ_HZ, 0.0f);
+  if (!vrefPwm) {
+    Serial.println("vREF PWM allocation failed!");
+    while (1) {}
+  }
+  vrefPwm->setPWM();
+  setVrefDuty(NORMAL_VREF_DUTY);
+
+  // servo0.attach(SERVO0);  // TEMP DISABLED for PWM timer conflict testing
 
   Can3.begin();
   Can3.setBaudRate(500000);
   Can3.enableMBInterrupts();
   Can3.onReceive(handleCAN);
-  Serial.println("System Initialized (CAN-based)");
 
-  digitalWrite(PMODE, LOW);
+  Serial.println("System Initialized");
+
+  digitalWrite(PMODE, HIGH);
+  delay(50);
   digitalWrite(nSLEEP, HIGH);
 
-  attachInterrupt(digitalPinToInterrupt(nFAULT), onNFaultISR, FALLING);
+  interrupts();
 
   sendRangeOfMotion();
   handleState();
-
-  for (int i = 0; i < 6; i++){
-    homeMotor(i);
-  }
 }
 
 void loop() {
+  if (homingRequested) {
+    homingRequested = false;
+    Serial.println("Homing request received via CAN (deferred to loop)");
+    homeMotor(homingIndexRequested);
+    sendRangeOfMotion();
+  }
 
   Can3.events();
+
   static unsigned long lastSend = 0;
   if (millis() - lastSend >= 100) {
     sendEncoderPositions();
     lastSend = millis();
   }
-  controlMotor(0);
-  controlMotor(1);
-  controlMotor(2);
-  controlMotor(3);
-  controlMotor(4);
-  controlMotor(5);
+
+  for (int i = 0; i < 6; i++) {
+    controlMotor(i);
+  }
 
   if (configChangeRequested) {
     configChangeRequested = false;
-    handleState();                  
+    handleState();
   }
 
-  /* static unsigned long lastPrint = 0;
+  static unsigned long lastPrint = 0;
   if (millis() - lastPrint >= 1000) {
-    Serial.print("X: "); Serial.print(processedX); Serial.print("\tY: "); Serial.println(processedY);
-    printEncoderData();
+    lastPrint = millis();
 
-    for (int i = 0; i < 6; i++) {
-      int raw = analogRead(motorSEN[i]);
-      float voltage = raw * (3.3 / 4095.0);
-      float current = voltage / 0.5;
-      Serial.print("M"); Serial.print(i);
-      Serial.print(": ADC="); Serial.print(raw);
-      Serial.print("  I="); Serial.print(current, 3);
-      Serial.print(" A   ");
-    }
+    printEncoderData();
+    printMotorDiagnostics();
+
+    Serial.print("nFAULT pin: ");
+    Serial.println(digitalRead(nFAULT) ? "HIGH" : "LOW");
+
     Serial.println();
-    lastPrint = millis(); 
-  }*/
+  }
+}
+
+void handleCAN(const CAN_message_t &msg) {
+  switch (msg.id) {
+    case CAN_ID_PWM_A_CMD: {
+      if (msg.len >= 6) loadPwmArray(PWM_A, msg);
+      break;
+    }
+
+    case CAN_ID_PWM_B_CMD: {
+      if (msg.len >= 6) loadPwmArray(PWM_B, msg);
+      break;
+    }
+
+    case CAN_ID_CONFIG_CMD: {
+      if (msg.len >= 1) {
+        requestedConfig = msg.buf[0];
+        configChangeRequested = true;
+      }
+      break;
+    }
+
+    case CAN_ID_HOMING_CMD: {
+      if (msg.len == 1 && msg.buf[0] == 1) {
+        homingIndexRequested = 0; // for now: motor 0
+        homingRequested = true;
+      }
+      break;
+    }
+
+    default:
+      break;
+  }
 }
 
 void nextState() {
@@ -255,39 +302,21 @@ void nextState() {
   handleState();
 }
 
-void onNFaultISR() {
-  nFaultFlag = true;
-}
-
-
 void handleState() {
-  // Map requestedConfig (0,1,2,3,...) to HandState
   HandState newState;
 
   switch (requestedConfig) {
-    case 0:
-      newState = CONFIG_1;
-      break;
-    case 1:
-      newState = CONFIG_2;
-      break;
-    case 2:
-      newState = CONFIG_3;
-      break;
-    case 3:
-      newState = CONFIG_4;
-      break;
+    case 0: newState = CONFIG_1; break;
+    case 1: newState = CONFIG_2; break;
+    case 2: newState = CONFIG_3; break;
+    case 3: newState = CONFIG_4; break;
     default:
-      // Ignore invalid values; keep current state
       Serial.print("Ignoring invalid requestedConfig: ");
       Serial.println(requestedConfig);
       return;
   }
 
-  // If nothing changed, don't spam serial or move servos
-  if (newState == currentState) {
-    return;
-  }
+  if (newState == currentState) return;
 
   currentState = newState;
 
@@ -297,46 +326,102 @@ void handleState() {
   switch (currentState) {
     case CONFIG_1:
       Serial.println("State 1: One-sided Grip");
-      servo0.write(160);
       break;
 
     case CONFIG_2:
       Serial.println("State 2: Pinch Grip");
-      servo0.write(90);
       break;
 
     case CONFIG_3:
       Serial.println("State 3: Claw Grip");
-      servo0.write(45);
       break;
 
     case CONFIG_4:
       Serial.println("State 4: Coffee Cup Grip");
-      servo0.write(15);
       break;
   }
 }
 
-
 void controlMotor(int index) {
-  analogWrite(motorPWM_A[index], PWM_A[index]);
-  analogWrite(motorPWM_B[index], PWM_B[index]);
+  const uint8_t a = PWM_A[index];
+  const uint8_t b = PWM_B[index];
+
+  if (a != lastPWM_A[index]) {
+    setMotorDutyByte(motorPwmA[index], a);
+    lastPWM_A[index] = a;
+  }
+  if (b != lastPWM_B[index]) {
+    setMotorDutyByte(motorPwmB[index], b);
+    lastPWM_B[index] = b;
+  }
+}
+
+void stopMotor(int index) {
+  PWM_A[index] = 0;
+  PWM_B[index] = 0;
+  controlMotor(index);
+}
+
+// ----------- Helpers -----------
+static inline uint16_t dutyByteToLevel16(uint8_t dutyByte) {
+  return (uint32_t)dutyByte * 65535u / 255u;
+}
+
+static inline void setMotorDutyByte(Teensy_PWM* pwm, uint8_t dutyByte) {
+  if (!pwm) return;
+  const uint16_t level = dutyByteToLevel16(dutyByte);
+  pwm->setPWM_manual((uint8_t)pwm->getPin(), level);
+}
+
+// vREF duty update using Teensy_PWM (0..255)
+void setVrefDuty(int dutyByte) {
+  dutyByte = constrain(dutyByte, 0, 255);
+
+  if ((uint8_t)dutyByte == lastVrefDuty) return;
+  lastVrefDuty = (uint8_t)dutyByte;
+
+  if (!vrefPwm) return;
+
+  const uint16_t level = dutyByteToLevel16((uint8_t)dutyByte);
+  vrefPwm->setPWM_manual((uint8_t)vrefPwm->getPin(), level);
 }
 
 void printEncoderData() {
-  Serial.print("Enc0: "); Serial.print(encoder0.read()); Serial.print("	");
-  Serial.print("Enc1: "); Serial.print(encoder1.read()); Serial.print("	");
-  Serial.print("Enc2: "); Serial.print(encoder2.read()); Serial.print("	");
-  Serial.print("Enc3: "); Serial.print(encoder3.read()); Serial.print("	");
-  Serial.print("Enc4: "); Serial.print(encoder4.read()); Serial.print("	");
+  Serial.print("Enc0: "); Serial.print(encoder0.read()); Serial.print("\t");
+  Serial.print("Enc1: "); Serial.print(encoder1.read()); Serial.print("\t");
+  Serial.print("Enc2: "); Serial.print(encoder2.read()); Serial.print("\t");
+  Serial.print("Enc3: "); Serial.print(encoder3.read()); Serial.print("\t");
+  Serial.print("Enc4: "); Serial.print(encoder4.read()); Serial.print("\t");
   Serial.print("Enc5: "); Serial.println(encoder5.read());
 }
 
-static void loadPwmArray(int *target, const CAN_message_t &msg) {
-  const uint8_t count = min<uint8_t>(6, msg.len);
-  for (uint8_t i = 0; i < count; ++i) {
-    target[i] = static_cast<int>(msg.buf[i]);
+void printMotorDiagnostics() {
+  constexpr float VADC = 3.3f;
+  constexpr float ADC_MAX = 4095.0f;
+  constexpr float RIPROPI_OHMS = 5100.0f;
+  constexpr float AIPROPI_A_PER_A = 450e-6f;
+
+  for (int i = 0; i < 6; i++) {
+    int raw = analogRead(motorSEN[i]);
+    float vSense = raw * (VADC / ADC_MAX);
+    float iMotor = vSense / (AIPROPI_A_PER_A * RIPROPI_OHMS);
+
+    Serial.print("M"); Serial.print(i);
+    Serial.print(": PWM_A="); Serial.print(PWM_A[i]);
+    Serial.print(" PWM_B="); Serial.print(PWM_B[i]);
+    Serial.print("  ADC="); Serial.print(raw);
+    Serial.print("  V="); Serial.print(vSense, 3);
+    Serial.print("  I="); Serial.print(iMotor, 3);
+    Serial.println(" A");
   }
+
+  Serial.print("vREF duty byte: ");
+  Serial.println(lastVrefDuty);
+}
+
+static void loadPwmArray(uint8_t *target, const CAN_message_t &msg) {
+  const uint8_t count = min<uint8_t>(6, msg.len);
+  for (uint8_t i = 0; i < count; ++i) target[i] = msg.buf[i];
 }
 
 void sendEncoderPositions() {
@@ -375,18 +460,13 @@ void sendRangeOfMotion() {
   }
 }
 
-void stopMotor(int index) {
-  PWM_A[index] = 0;
-  PWM_B[index] = 0;
-  analogWrite(motorPWM_A[index], 0);
-  analogWrite(motorPWM_B[index], 0);
-}
-
 // direction: +1 or -1
 void driveMotorHoming(int index, int direction) {
-  // Scale homingSpeeds[index] (0–100) up to 0–255
   int duty = map(homingSpeeds[index], 0, 100, 0, 255);
   duty = constrain(duty, 0, 255);
+
+  Serial.print("Current Homing Speed ");
+  Serial.println(duty);
 
   if (direction > 0) {
     PWM_A[index] = duty;
@@ -399,7 +479,6 @@ void driveMotorHoming(int index, int direction) {
     PWM_B[index] = 0;
   }
 
-  // Actually apply to the pins
   controlMotor(index);
 }
 
@@ -407,92 +486,43 @@ void homeMotor(int index) {
   Serial.print("Simple homing motor ");
   Serial.println(index);
 
-  // Set homing VREF for this motor (same for all for now)
-  analogWrite(vREF, homingVoltage[index]);
+  int nf = digitalRead(nFAULT);
+  if (nf == LOW) {
+    Serial.println("homeMotor(): nFAULT is LOW before start. Attempting to clear via nSLEEP toggle...");
 
-  // ---------- First direction: find high end ---------- //
-  noInterrupts();
-  nFaultFlag = false;
-  interrupts();
+    digitalWrite(nSLEEP, LOW);
+    delay(5);
+    digitalWrite(nSLEEP, HIGH);
+    delay(5);
 
-  // Assume "positive" direction moves toward the high end
+    nf = digitalRead(nFAULT);
+    Serial.print("After nSLEEP toggle, nFAULT = ");
+    Serial.println(nf == HIGH ? "HIGH" : "LOW");
+
+    if (nf == LOW) {
+      Serial.println("Aborting homing: nFAULT still LOW (driver still in fault). ");
+      setVrefDuty(NORMAL_VREF_DUTY);
+      return;
+    }
+  }
+
+  // Set homing VREF for this motor
+  setVrefDuty(homingVoltage[index]);
+  
+  // Dead-simple homing debug step: drive until nFAULT asserts low
   driveMotorHoming(index, +1);
-
-  unsigned long startHigh = millis();
-
-  while (!nFaultFlag && (millis() - startHigh < HOMING_HIGH_TIMEOUT_MS)) {
-    // Let the rest of the system breathe
-    Can3.events();
-    // You can also send encoder updates, etc., if you want
-    delay(1);
-  }
-
-  // We’re done driving in the first direction either because:
-  // - nFAULT fired, or
-  // - we timed out
-  stopMotor(index);
-
-  if (!nFaultFlag) {
-    Serial.println("High-end homing timeout; nFAULT never triggered.");
-    return;  // Bail out early; don't try second direction
-  }
-
-  long highPosHit = encoders[index]->read();
-  Serial.print("High end hit at: ");
-  Serial.println(highPosHit);
-
-  // Pull back a little from the hard stop
-  long targetHigh = highPosHit - pullbackCounts[index];
-  driveMotorHoming(index, -1);
-  while (encoders[index]->read() > targetHigh) {
-    delay(1);
-  }
-  stopMotor(index);
-
-  long highPos = encoders[index]->read();
-  highROM[index] = highPos;
-  Serial.print("High ROM set to: ");
-  Serial.println(highROM[index]);
-
-  // ---------- Second direction: find low end ---------- //
-  noInterrupts();
-  nFaultFlag = false;
-  interrupts();
-
-  // Drive opposite direction toward low end
-  driveMotorHoming(index, -1);
-
-  unsigned long startLow = millis();
-
-  while (!nFaultFlag && (millis() - startLow < HOMING_LOW_TIMEOUT_MS)) {
-    Can3.events();
+  delay(500);
+  unsigned long lastWaitPrint = 0;
+  while (digitalRead(nFAULT) == HIGH) {
+    if (millis() - lastWaitPrint >= 250) {
+      lastWaitPrint = millis();
+      Serial.println("[HOMING DEBUG] Waiting for nFAULT... pin=HIGH");
+    }
     delay(1);
   }
 
   stopMotor(index);
+  Serial.println("[HOMING DEBUG] nFAULT went LOW! Stopping motor and exiting debug homing step.");
 
-  if (!nFaultFlag) {
-    Serial.println("Low-end homing timeout; nFAULT never triggered.");
-    return;  // Bail out; we at least still have highROM[index] set
-  }
-
-  long lowPosHit = encoders[index]->read();
-  Serial.print("Low end hit at: ");
-  Serial.println(lowPosHit);
-
-  // Pull forward a bit from the hard stop
-  long targetLow = lowPosHit + pullbackCounts[index];
-  driveMotorHoming(index, +1);
-  while (encoders[index]->read() < targetLow) {
-    delay(1);
-  }
-  stopMotor(index);
-
-  long lowPos = encoders[index]->read();
-  lowROM[index] = lowPos;
-  Serial.print("Low ROM set to: ");
-  Serial.println(lowROM[index]);
-
-  // Restore VREF to whatever you want for normal operation later if needed
-  // analogWrite(vREF, NORMAL_VREF_DUTY);
+  setVrefDuty(NORMAL_VREF_DUTY);
 }
