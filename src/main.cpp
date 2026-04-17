@@ -5,19 +5,22 @@
 // Update (2025-12-19): REMOVED nFAULT ISR + related globals/prints for debug isolation
 // Update (2026-01-03): Added queued homing sequence (Motor 0 -> Motor 1)
 
-// #include <PWMServo.h>  // TEMP DISABLED for PWM timer conflict testing
 #include <Arduino.h>
 #include <Encoder.h>
 #include <FlexCAN_T4.h>
 #include <Teensy_PWM.h>
+#include <IntervalTimer.h>
 
 // ----------- CAN Message Map ----------- //
 
 // Brain -> Hand
 constexpr uint32_t CAN_ID_CONFIG_CMD      = 0x100;  // requestedConfig
 constexpr uint32_t CAN_ID_HOMING_CMD      = 0x120;  // homing start
-constexpr uint32_t CAN_ID_PWM_A_CMD       = 0x200;  // PWM_A[0..5]
-constexpr uint32_t CAN_ID_PWM_B_CMD       = 0x201;  // PWM_B[0..5]
+
+// NEW: Brain -> Hand (absolute targets, int32 little-endian)
+constexpr uint32_t CAN_ID_SET_POS_01      = 0x210;  // pos0,pos1 (int32 LE)
+constexpr uint32_t CAN_ID_SET_POS_23      = 0x211;  // pos2,pos3
+constexpr uint32_t CAN_ID_SET_POS_45      = 0x212;  // pos4,pos5
 
 // Hand -> Brain
 constexpr uint32_t CAN_ID_ENCODER_BASE    = 0x110;  // + motor index
@@ -67,13 +70,28 @@ Encoder encoder5(ENC5_A, ENC5_B);
 #define MOTOR5_SEN 16
 
 // ----------- Servo Pins ----------- //
-#define SERVO0 33
+#define SERVO0 40
+#define SERVO1 41
+
+// ----------- Servo ISR PWM ----------- //
+constexpr uint32_t SERVO_FRAME_US = 20000; // 20 ms = 50 Hz
+constexpr uint32_t SERVO_MIN_PULSE_US = 500;
+constexpr uint32_t SERVO_MAX_PULSE_US = 2500;
+constexpr float SERVO_RANGE_DEG = 270.0f;
+
+IntervalTimer servoTimer0;
+IntervalTimer servoTimer1;
+
+volatile uint32_t servoPulseWidthUs0 = 1500;
+volatile uint32_t servoPulseWidthUs1 = 1500;
+volatile bool servoPulseHigh0 = false;
+volatile bool servoPulseHigh1 = false;
 
 // ----------- Motor Driver Pins Declaration ----------- //
 #define PMODE 12
 #define nFAULT 26
 #define nSLEEP 27
-#define vREF 13
+#define vREF 33
 
 // ----------- CAN Declaration ----------- //
 FlexCAN_T4<CAN3, RX_SIZE_256, TX_SIZE_16> Can3;
@@ -84,14 +102,11 @@ volatile bool configChangeRequested = false;
 // Homing request flag (set by CAN, executed in loop)
 volatile bool homingRequested = false;
 
-// ------------------------------
-// Homing sequence (queued)
-// ------------------------------
 volatile bool homingActive = false;
-volatile int homingQueueIndex = 0;
 
-// Which motors to home (in order)
-constexpr int HOMING_SEQUENCE[] = {1};
+// Which motors to home when a homing command is received.
+// All listed motors run through the non-blocking 6-step homing state machine.
+constexpr int HOMING_SEQUENCE[] = {0, 2};
 constexpr int HOMING_SEQUENCE_LEN = (int)(sizeof(HOMING_SEQUENCE) / sizeof(HOMING_SEQUENCE[0]));
 
 // ----------- Global ROM limits for Motor Limits ----------- //
@@ -103,6 +118,14 @@ Encoder* encoders[6] = { &encoder0, &encoder1, &encoder2, &encoder3, &encoder4, 
 const int motorPWM_A[6] = {MOTOR0_PWM_A, MOTOR1_PWM_A, MOTOR2_PWM_A, MOTOR3_PWM_A, MOTOR4_PWM_A, MOTOR5_PWM_A};
 const int motorPWM_B[6] = {MOTOR0_PWM_B, MOTOR1_PWM_B, MOTOR2_PWM_B, MOTOR3_PWM_B, MOTOR4_PWM_B, MOTOR5_PWM_B};
 const int motorSEN[6]   = {MOTOR0_SEN, MOTOR1_SEN, MOTOR2_SEN, MOTOR3_SEN, MOTOR4_SEN, MOTOR5_SEN};
+
+// NEW: absolute position targets received from Brain (raw, unclamped for now)
+volatile int32_t posTarget[6] = {0,0,0,0,0,0};
+
+// NEW: flags for safe printing outside ISR
+volatile bool posTargetsUpdated = false;
+elapsedMillis posTargetsUpdatedAgeMs;  // time since last update
+
 
 // Incoming commands from brain (0..255 like old analogWrite)
 uint8_t PWM_A[6] = {0, 0, 0, 0, 0, 0};
@@ -117,14 +140,34 @@ uint8_t lastVrefDuty = 0;
 
 
 // =============================
+// Position Controller (P now; PI/PID ready)
+// =============================
+enum ControlMode_t { MODE_POS = 0, MODE_PWM = 1 };
+volatile ControlMode_t ControlMode[6] = { MODE_POS, MODE_POS, MODE_POS, MODE_POS, MODE_POS, MODE_POS };
+
+// Per-motor gains (start with small Kp; Ki/Kd = 0 for now)
+float Kp[6] = { 0.15f, 0.050f, 0.150f, 0.050f, 0.050f, 0.050f };
+float Ki[6] = { 0.001f,   0.001f,   0.001f,   0.0f,   0.0f,   0.0f   };
+float Kd[6] = { 0.0f,   0.0f,   0.0f,   0.0f,   0.0f,   0.0f   };
+
+// Controller memory (for PI/PID later)
+float integ[6] = {0,0,0,0,0,0};
+int32_t prevErr[6] = {0,0,0,0,0,0};
+
+// Output shaping
+int32_t posDeadbandCounts[6] = { 10, 10, 10, 10, 10, 10 };   // within this, command 0
+uint8_t posMaxDuty[6]        = { 250, 255, 255, 255, 255, 255};  // clamp output
+uint8_t posMinDuty[6]        = { 50, 115, 90, 60, 90, 60 };   // overcome static friction (0 disables)
+
+// =============================
 // Homing Constants Setup
 // =============================
 
 // Stall detection thresholds [Amps]
 // NOTE: Drive–Brake tends to produce higher average IPROPI/current than Drive–Coast at the same mechanical load.
 // So we allow separate thresholds for BLUNT (drive–coast) vs PRECISE (drive–brake).
-float homingStallA_blunt[6]   = { 0.30f, 0.2f, 0.30f, 0.20f, 0.30f, 0.20f };
-float homingStallA_precise[6] = { 0.20f, 0.50f, .20f, 0.50f, 0.20f, 0.50f };
+float homingStallA_blunt[6]   = { 0.30f, 0.10f, 0.30f, 0.20f, 0.30f, 0.20f };
+float homingStallA_precise[6] = { 0.20f, 0.20f, .20f, 0.50f, 0.20f, 0.50f };
 
 // Ignore current sensing for a short time after entering drive–brake to avoid immediate false "stall" due to braking current spikes.
 uint32_t homingBrakeBlankMs[6] = { 50, 50, 50, 50, 50, 50 };
@@ -147,11 +190,16 @@ uint32_t homingBluntTimeoutHighMs[6] = { 12000, 12000, 12000, 12000, 12000, 1200
 
 
 // Blunt seek (drive–coast)
-uint8_t homingBluntDuty[6] = { 220, 220, 220, 220, 220, 220 };
+uint8_t homingBluntDuty[6] = { 220, 180, 220, 220, 220, 220 };
 
 // Backoff distances [encoder counts]
-int homingBluntBackoffCounts[6] = { 1000, 2000, 1000, 2000, 1000, 4000 };
-int homingTouchBackoffCounts[6] = { 800, 2000, 800, 2000, 800, 4000 };
+int homingBluntBackoffCounts[6] = { 1000, 5000, 1000, 2000, 1000, 4000 };
+int homingTouchBackoffCounts[6] = { 800, 7000, 800, 3000, 800, 5000 };
+
+// Backoff timeouts [ms]
+// Motors 1/3/5 use larger backoff distances and need longer windows to fully clear the stop.
+uint32_t homingBluntBackoffTimeoutMs[6] = { 1000, 2500, 1000, 2500, 1000, 3500 };
+uint32_t homingTouchBackoffTimeoutMs[6] = { 1000, 3500, 1000, 3000, 1000, 4500 };
 
 // Precise touch-off (drive–brake)
 uint8_t  homingPreciseDuty[6]      = { 200, 200, 200, 200, 200, 220 };
@@ -159,7 +207,6 @@ uint32_t homingPreciseTimeoutMs[6] = { 1600, 1600, 1600, 1600, 1600, 1600 };
 uint8_t  homingTouchRepeats[6]     = { 3, 3, 3, 3, 3, 3 };
 
 // Midpoint move
-uint8_t  homingMidDuty[6]        = { 200, 200, 200, 230, 200, 200 };
 uint32_t homingMidTimeoutMs[6]   = { 5000, 5000, 5000, 5000, 5000, 5000 };
 int      homingMidTolCounts[6]   = { 200, 200, 200, 200, 200, 200 };
 
@@ -169,23 +216,46 @@ const int homingVoltage[6] = {255, 255, 255, 255, 255, 255};
 // Normal (full-scale) vREF duty for regular operation
 const int NORMAL_VREF_DUTY = 255;  // 100% duty (0..255)
 
-// Homing speeds [0-100] P will be scaled later
-const int homingSpeeds[6] = {50, 50, 50, 50, 50, 50};
-
-// Pullback distances after stall [encoder counts]
-const int pullbackCounts[6] = {100, 100, 100, 100, 100, 100};
-
 //Buys time for Cap to settle.
 static constexpr uint32_t VREF_SETTLE_MS   = 25;
+static constexpr uint32_t HOMING_TOUCH_SETTLE_MS = 25;
 
-//Time oveer which we ramp up to full duty. Used to avoid falsely triggering nFAULT due to current surge.
-static constexpr uint32_t SOFTSTART_MS     = 60;
+constexpr int HOMING_MAX_TOUCH_SAMPLES = 5;
 
-//Delays polling of nFAULT, reduced risk of false flagging nFUALT due to current surge on startup.
-static constexpr uint32_t STARTUP_BLANK_MS = 35;
+enum HomingPhase {
+  HOMING_IDLE = 0,
+  HOMING_VREF_SETTLE,
+  HOMING_STEP1_UNSTICK_FWD,
+  HOMING_STEP1_UNSTICK_REV,
+  HOMING_STEP2_BLUNT_LOW,
+  HOMING_STEP2_BACKOFF_LOW,
+  HOMING_STEP3_PRECISE_LOW_DRIVE,
+  HOMING_STEP3_PRECISE_LOW_BACKOFF,
+  HOMING_STEP3_PRECISE_LOW_SETTLE,
+  HOMING_STEP4_BLUNT_HIGH,
+  HOMING_STEP4_BACKOFF_HIGH,
+  HOMING_STEP5_PRECISE_HIGH_DRIVE,
+  HOMING_STEP5_PRECISE_HIGH_BACKOFF,
+  HOMING_STEP5_PRECISE_HIGH_SETTLE,
+  HOMING_STEP6_MOVE_MID
+};
 
+struct HomingState {
+  bool active = false;
+  HomingPhase phase = HOMING_IDLE;
+  uint32_t phaseStartMs = 0;
+  uint32_t lastSampleMs = 0;
+  uint32_t aboveStartMs = 0;
+  long phaseStartPos = 0;
+  uint8_t touchRepeatTarget = 0;
+  uint8_t touchRepeatIndex = 0;
+  long lowSamples[HOMING_MAX_TOUCH_SAMPLES] = {0};
+  long highSamples[HOMING_MAX_TOUCH_SAMPLES] = {0};
+  long lowEnd = 0;
+  long highEnd = 0;
+};
 
-// PWMServo servo0;  // TEMP DISABLED for PWM timer conflict testing
+HomingState homingState[6];
 
 // =============================
 // Teensy_PWM setup
@@ -200,53 +270,56 @@ Teensy_PWM* motorPwmB[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr
 // vREF PWM object
 Teensy_PWM* vrefPwm = nullptr;
 
+// Declaration for finger configurations driven by servos
+enum HandState { CONFIG_1, CONFIG_2, CONFIG_3, CONFIG_4 };
+HandState currentState = CONFIG_1;
+
 // ----------- Function declarations -----------
 void handleCAN(const CAN_message_t &msg);
 void sendEncoderPositions();
 void sendRangeOfMotion();
-void nextState();
 void handleState();
 void printEncoderData();
 void printMotorDiagnostics();
+void printPositionControllerDiagnostics();
 void controlMotor(int index);
-void homeMotor(int index);
+void startHomingMotor(int index);
+void updateHomingMotor(int index);
+void beginHomingSequence();
+void updateHomingSequence();
 void stopMotor(int index);
-void driveMotorHoming(int index, int direction);
-void driveMotorHomingSoftStart(int index, int direction, int targetDuty, uint32_t rampMs);
-
-
-static void loadPwmArray(uint8_t *target, const CAN_message_t &msg);
 
 // ----------- Helper forward declarations -----------
+void servoISR0();
+void servoISR1();
+void setServoPulseUs(uint8_t servoIndex, uint32_t us);
+void setServoAngle(uint8_t servoIndex, float deg);
+void applyServoState(HandState state);
 static inline uint16_t dutyByteToLevel16(uint8_t dutyByte);
 static inline void setMotorDutyByte(Teensy_PWM* pwm, uint8_t dutyByte);
 void setVrefDuty(int dutyByte);
 static inline float readMotorCurrentA(int index);
 static inline void setDriveCoast(int index, int dir, uint8_t duty);
 static inline void setDriveBrake(int index, int dir, uint8_t driveDuty);
-static bool waitForMotionCounts(int idx, int dir, int minDeltaCounts, uint32_t msMax);
+static inline int32_t unpack_i32_le(const uint8_t *b);
+static inline void pack_i32_le(uint8_t *b, int32_t v);
+static inline void enterPosModeHold(int index);
+void updatePositionController(int index, float dt_s);
 
-// Homing helper functions
-static bool homingStallDetectedTimed(int index,
-                                    float stallA,
-                                    uint32_t debounceMs,
-                                    uint32_t sampleMs,
-                                    uint32_t maxMs,
-                                    bool &faulted,
-                                    uint32_t blankMs = 0);
-
-static void homingBackoffFrom(int index,
-                              int approachDir,
-                              int counts,
-                              uint8_t duty,
-                              uint32_t timeoutMs = 750);
+static void refreshHomingVref();
+static void finishHomingMotor(int index, bool success, const char *message);
+static void enterHomingPhase(int index, HomingPhase phase);
+static bool homingMotionReached(int index, int dir, int minDeltaCounts);
+static int homingTouchRepeatsClamped(int index);
+static bool homingStallDetectedNonBlocking(int index,
+                                           float stallA,
+                                           uint32_t debounceMs,
+                                           uint32_t sampleMs,
+                                           uint32_t maxMs,
+                                           uint32_t blankMs = 0);
 
 static inline long median3(long a, long b, long c);
 static long trimmedMean(const long *samples, int n);
-
-// Declaration for finger configurations driven by servos
-enum HandState { CONFIG_1, CONFIG_2, CONFIG_3, CONFIG_4 };
-HandState currentState = CONFIG_1;
 
 void setup() {
   Serial.begin(115200);
@@ -264,6 +337,12 @@ void setup() {
   pinMode(vREF, OUTPUT);
   pinMode(nFAULT, INPUT_PULLUP);   // external pull-up
   pinMode(nSLEEP, OUTPUT);
+
+  // Servo outputs (active-low pulse timing to match existing servo ISR behavior)
+  pinMode(SERVO0, OUTPUT);
+  pinMode(SERVO1, OUTPUT);
+  digitalWriteFast(SERVO0, HIGH);
+  digitalWriteFast(SERVO1, HIGH);
 
   // ------------------------------
   // Initialize Teensy_PWM outputs (motors)
@@ -293,7 +372,6 @@ void setup() {
   vrefPwm->setPWM();
   setVrefDuty(NORMAL_VREF_DUTY);
 
-  // servo0.attach(SERVO0);  // TEMP DISABLED for PWM timer conflict testing
 
   Can3.begin();
   Can3.setBaudRate(500000);
@@ -306,6 +384,10 @@ void setup() {
   delay(50);
   digitalWrite(nSLEEP, HIGH);
 
+  // Kick off each servo ISR; each timer maintains a 50 Hz frame.
+  servoTimer0.begin(servoISR0, 50);
+  servoTimer1.begin(servoISR1, 50);
+
   interrupts();
 
   sendRangeOfMotion();
@@ -313,32 +395,13 @@ void setup() {
 }
 
 void loop() {
-  // ------------------------------
-  // Homing sequence runner (Motor 0 -> Motor 1)
-  // ------------------------------
-  if (homingRequested && homingActive) {
+  if (homingRequested) {
     homingRequested = false;
-
-    if (homingQueueIndex < HOMING_SEQUENCE_LEN) {
-      const int motor = HOMING_SEQUENCE[homingQueueIndex];
-
-      Serial.print("Starting homing for motor ");
-      Serial.println(motor);
-
-      homeMotor(motor);
-      sendRangeOfMotion();
-
-      homingQueueIndex++;
-
-      // Kick the next motor on the next loop iteration
-      homingRequested = true;
-    } else {
-      homingActive = false;
-      Serial.println("Homing sequence complete (motors 0 -> 1)");
-    }
+    beginHomingSequence();
   }
 
   Can3.events();
+  updateHomingSequence();
 
   static unsigned long lastSend = 0;
   if (millis() - lastSend >= 100) {
@@ -346,9 +409,26 @@ void loop() {
     lastSend = millis();
   }
 
+// Run POS controller at fixed rate (example: 5ms = 200 Hz)
+static elapsedMicros posCtrlTimerUs;
+static constexpr uint32_t POS_CTRL_PERIOD_US = 5000; // 5,000 us
+if (posCtrlTimerUs >= POS_CTRL_PERIOD_US) {
+  posCtrlTimerUs -= POS_CTRL_PERIOD_US; // stable timing
+  const float dt_s = POS_CTRL_PERIOD_US * 1e-6f;
+
   for (int i = 0; i < 6; i++) {
+    if (ControlMode[i] == MODE_POS) {
+      updatePositionController(i, dt_s);
+    }
+  }
+}
+
+// Existing PWM application (only matters in MODE_PWM)
+for (int i = 0; i < 6; i++) {
+  if (ControlMode[i] == MODE_PWM) {
     controlMotor(i);
   }
+}
 
   if (configChangeRequested) {
     configChangeRequested = false;
@@ -356,11 +436,12 @@ void loop() {
   }
 
   static unsigned long lastPrint = 0;
-  if (millis() - lastPrint >= 1000) {
+  if (!homingActive && millis() - lastPrint >= 100) {
     lastPrint = millis();
 
     printEncoderData();
     printMotorDiagnostics();
+    printPositionControllerDiagnostics();
 
     Serial.print("nFAULT pin: ");
     Serial.println(digitalRead(nFAULT) ? "HIGH" : "LOW");
@@ -371,15 +452,7 @@ void loop() {
 
 void handleCAN(const CAN_message_t &msg) {
   switch (msg.id) {
-    case CAN_ID_PWM_A_CMD: {
-      if (msg.len >= 6) loadPwmArray(PWM_A, msg);
-      break;
-    }
 
-    case CAN_ID_PWM_B_CMD: {
-      if (msg.len >= 6) loadPwmArray(PWM_B, msg);
-      break;
-    }
 
     case CAN_ID_CONFIG_CMD: {
       if (msg.len >= 1) {
@@ -391,13 +464,37 @@ void handleCAN(const CAN_message_t &msg) {
 
     case CAN_ID_HOMING_CMD: {
       if (msg.len == 1 && msg.buf[0] == 1) {
-        // Start the queued homing sequence (0 -> 1) if not already running
-        if (!homingActive) {
-          homingActive = true;
-          homingQueueIndex = 0;
-          homingRequested = true;
-          Serial.println("Homing sequence requested (motors 0 -> 1)");
-        }
+        homingRequested = true;
+      }
+      break;
+    }
+
+    case CAN_ID_SET_POS_01: {
+      if (msg.len == 8) {
+        posTarget[0] = unpack_i32_le(&msg.buf[0]);
+        posTarget[1] = unpack_i32_le(&msg.buf[4]);
+        posTargetsUpdated = true;
+        posTargetsUpdatedAgeMs = 0;
+      }
+      break;
+    }
+
+    case CAN_ID_SET_POS_23: {
+      if (msg.len == 8) {
+        posTarget[2] = unpack_i32_le(&msg.buf[0]);
+        posTarget[3] = unpack_i32_le(&msg.buf[4]);
+        posTargetsUpdated = true;
+        posTargetsUpdatedAgeMs = 0;
+      }
+      break;
+    }
+
+    case CAN_ID_SET_POS_45: {
+      if (msg.len == 8) {
+        posTarget[4] = unpack_i32_le(&msg.buf[0]);
+        posTarget[5] = unpack_i32_le(&msg.buf[4]);
+        posTargetsUpdated = true;
+        posTargetsUpdatedAgeMs = 0;
       }
       break;
     }
@@ -405,13 +502,6 @@ void handleCAN(const CAN_message_t &msg) {
     default:
       break;
   }
-}
-
-void nextState() {
-  currentState = static_cast<HandState>((currentState + 1) % 4);
-  Serial.print("Transitioned to state: ");
-  Serial.println(currentState);
-  handleState();
 }
 
 void handleState() {
@@ -428,7 +518,10 @@ void handleState() {
       return;
   }
 
-  if (newState == currentState) return;
+  if (newState == currentState) {
+    applyServoState(currentState);
+    return;
+  }
 
   currentState = newState;
 
@@ -452,6 +545,8 @@ void handleState() {
       Serial.println("State 4: Coffee Cup Grip");
       break;
   }
+
+  applyServoState(currentState);
 }
 
 void controlMotor(int index) {
@@ -477,6 +572,112 @@ void stopMotor(int index) {
 // ----------- Helpers -----------
 static inline uint16_t dutyByteToLevel16(uint8_t dutyByte) {
   return (uint32_t)dutyByte * 65535u / 255u;
+}
+
+void servoISR0() {
+  if (!servoPulseHigh0) {
+    digitalWriteFast(SERVO0, LOW);
+    servoPulseHigh0 = true;
+
+    uint32_t t = servoPulseWidthUs0;
+    if (t < 1) t = 1;
+    servoTimer0.update(t);
+  } else {
+    digitalWriteFast(SERVO0, HIGH);
+    servoPulseHigh0 = false;
+
+    uint32_t t = SERVO_FRAME_US - servoPulseWidthUs0;
+    if (t < 1) t = 1;
+    servoTimer0.update(t);
+  }
+}
+
+void servoISR1() {
+  if (!servoPulseHigh1) {
+    digitalWriteFast(SERVO1, LOW);
+    servoPulseHigh1 = true;
+
+    uint32_t t = servoPulseWidthUs1;
+    if (t < 1) t = 1;
+    servoTimer1.update(t);
+  } else {
+    digitalWriteFast(SERVO1, HIGH);
+    servoPulseHigh1 = false;
+
+    uint32_t t = SERVO_FRAME_US - servoPulseWidthUs1;
+    if (t < 1) t = 1;
+    servoTimer1.update(t);
+  }
+}
+
+void setServoPulseUs(uint8_t servoIndex, uint32_t us) {
+  if (us < SERVO_MIN_PULSE_US) us = SERVO_MIN_PULSE_US;
+  if (us > SERVO_MAX_PULSE_US) us = SERVO_MAX_PULSE_US;
+
+  noInterrupts();
+  if (servoIndex == 0) {
+    servoPulseWidthUs0 = us;
+  } else if (servoIndex == 1) {
+    servoPulseWidthUs1 = us;
+  }
+  interrupts();
+}
+
+void setServoAngle(uint8_t servoIndex, float deg) {
+  if (deg < 0.0f) deg = 0.0f;
+  if (deg > SERVO_RANGE_DEG) deg = SERVO_RANGE_DEG;
+
+  const float span = (float)(SERVO_MAX_PULSE_US - SERVO_MIN_PULSE_US);
+  const uint32_t us = (uint32_t)(SERVO_MIN_PULSE_US + (deg / SERVO_RANGE_DEG) * span);
+  setServoPulseUs(servoIndex, us);
+}
+
+void applyServoState(HandState state) {
+  switch (state) {
+    case CONFIG_1:
+      setServoAngle(0, 5.0f);
+      setServoAngle(1, 210.0f);
+      break;
+    case CONFIG_2:
+      setServoAngle(0, 102.0f);
+      setServoAngle(1, 98.0f);
+      break;
+    case CONFIG_3:
+      setServoAngle(0, 140.0f);
+      setServoAngle(1, 45.0f);
+      break;
+    case CONFIG_4:
+      setServoAngle(0, 210.0f);
+      setServoAngle(1, 5.0f);
+      break;
+  }
+}
+
+static inline int32_t unpack_i32_le(const uint8_t *b) {
+  return (int32_t)b[0]
+       | ((int32_t)b[1] << 8)
+       | ((int32_t)b[2] << 16)
+       | ((int32_t)b[3] << 24);
+}
+
+static inline void pack_i32_le(uint8_t *b, int32_t v) {
+  b[0] = (uint8_t)(v & 0xFF);
+  b[1] = (uint8_t)((v >> 8) & 0xFF);
+  b[2] = (uint8_t)((v >> 16) & 0xFF);
+  b[3] = (uint8_t)((v >> 24) & 0xFF);
+}
+
+static inline void enterPosModeHold(int index) {
+  // Hold current position so we don't jump
+  const int32_t pos = (int32_t)encoders[index]->read();
+  noInterrupts();
+  posTarget[index] = pos;
+  interrupts();
+
+  integ[index] = 0.0f;
+  prevErr[index] = 0;
+
+  ControlMode[index] = MODE_POS;
 }
 
 static inline void setMotorDutyByte(Teensy_PWM* pwm, uint8_t dutyByte) {
@@ -534,21 +735,7 @@ static inline void setDriveBrake(int index, int dir, uint8_t driveDuty) {
   controlMotor(index);
 }
 
-static bool waitForMotionCounts(int idx, int dir, int minDeltaCounts, uint32_t msMax) {
-  const long start = encoders[idx]->read();
-  const uint32_t t0 = millis();
-  while (millis() - t0 < msMax) {
-    const long now = encoders[idx]->read();
-    const long d = now - start;
-    if ((dir > 0 && d >= minDeltaCounts) || (dir < 0 && d <= -minDeltaCounts)) return true;
-  }
-  return false;
-}
-
-// ------------------------------
-// Homing helper functions
-// ------------------------------
-
+#if 0
 static bool homingStallDetectedTimed(int index,
                                     float stallA,
                                     uint32_t debounceMs,
@@ -556,7 +743,7 @@ static bool homingStallDetectedTimed(int index,
                                     uint32_t maxMs,
                                     bool &faulted,
                                     uint32_t blankMs) {
-  // NOTE: nFAULT is intentionally ignored for homing (per user request).
+  // NOTE: nFAULT is intentionally ignored for homing.
   // We rely on current-sense stall detection + timeouts instead.
   // blankMs: ignore current sensing for the first blankMs after starting this detection window.
   faulted = false;
@@ -607,6 +794,7 @@ static void homingBackoffFrom(int index,
 
   stopMotor(index);
 }
+#endif
 
 static inline long median3(long a, long b, long c) {
   if ((a <= b && b <= c) || (c <= b && b <= a)) return b;
@@ -631,6 +819,374 @@ static long trimmedMean(const long *samples, int n) {
     return sum / (n - 2);
   }
   return sum / n;
+}
+
+static bool homingMotionReached(int index, int dir, int minDeltaCounts) {
+  const long now = encoders[index]->read();
+  const long delta = now - homingState[index].phaseStartPos;
+  return (dir > 0) ? (delta >= minDeltaCounts) : (delta <= -minDeltaCounts);
+}
+
+static int homingTouchRepeatsClamped(int index) {
+  return constrain((int)homingTouchRepeats[index], 1, HOMING_MAX_TOUCH_SAMPLES);
+}
+
+static bool homingStallDetectedNonBlocking(int index,
+                                           float stallA,
+                                           uint32_t debounceMs,
+                                           uint32_t sampleMs,
+                                           uint32_t maxMs,
+                                           uint32_t blankMs) {
+  HomingState &state = homingState[index];
+  const uint32_t now = millis();
+  const uint32_t elapsed = now - state.phaseStartMs;
+
+  if (elapsed >= maxMs) {
+    return false;
+  }
+
+  if (elapsed < blankMs) {
+    state.aboveStartMs = 0;
+    return false;
+  }
+
+  if ((now - state.lastSampleMs) < sampleMs) {
+    return false;
+  }
+
+  state.lastSampleMs = now;
+
+  const float currentA = readMotorCurrentA(index);
+  if (currentA >= stallA) {
+    if (state.aboveStartMs == 0) {
+      state.aboveStartMs = now;
+    }
+    if ((now - state.aboveStartMs) >= debounceMs) {
+      return true;
+    }
+  } else {
+    state.aboveStartMs = 0;
+  }
+
+  return false;
+}
+
+static void refreshHomingVref() {
+  int requestedDuty = NORMAL_VREF_DUTY;
+  bool anyActive = false;
+
+  for (int i = 0; i < 6; i++) {
+    if (homingState[i].active) {
+      requestedDuty = anyActive ? max(requestedDuty, homingVoltage[i]) : homingVoltage[i];
+      anyActive = true;
+    }
+  }
+
+  setVrefDuty(requestedDuty);
+}
+
+static void enterHomingPhase(int index, HomingPhase phase) {
+  HomingState &state = homingState[index];
+  state.phase = phase;
+  state.phaseStartMs = millis();
+  state.lastSampleMs = 0;
+  state.aboveStartMs = 0;
+  state.phaseStartPos = encoders[index]->read();
+}
+
+static void finishHomingMotor(int index, bool success, const char *message) {
+  HomingState &state = homingState[index];
+
+  stopMotor(index);
+  state.active = false;
+  state.phase = HOMING_IDLE;
+  ControlMode[index] = MODE_POS;
+
+  if (!success) {
+    enterPosModeHold(index);
+    Serial.print("Homing aborted for motor ");
+    Serial.print(index);
+    Serial.print(": ");
+    Serial.println(message);
+  } else {
+    Serial.print("Homing complete for motor ");
+    Serial.print(index);
+    Serial.print(". low=");
+    Serial.print(lowROM[index]);
+    Serial.print(" high=");
+    Serial.print(highROM[index]);
+    Serial.print(" mid=");
+    Serial.println((lowROM[index] + highROM[index]) / 2);
+  }
+
+  refreshHomingVref();
+  sendRangeOfMotion();
+}
+
+void startHomingMotor(int index) {
+  HomingState &state = homingState[index];
+
+  state = HomingState{};
+  state.active = true;
+  state.touchRepeatTarget = (uint8_t)homingTouchRepeatsClamped(index);
+
+  ControlMode[index] = MODE_PWM;
+  stopMotor(index);
+  refreshHomingVref();
+  enterHomingPhase(index, HOMING_VREF_SETTLE);
+
+  Serial.print("Starting homing for motor ");
+  Serial.println(index);
+}
+
+void beginHomingSequence() {
+  bool startedAny = false;
+
+  for (int i = 0; i < HOMING_SEQUENCE_LEN; i++) {
+    const int motor = HOMING_SEQUENCE[i];
+    if (motor < 0 || motor >= 6) {
+      continue;
+    }
+
+    if (!homingState[motor].active) {
+      startHomingMotor(motor);
+      startedAny = true;
+    }
+  }
+
+  homingActive = startedAny || homingActive;
+}
+
+void updateHomingMotor(int index) {
+  HomingState &state = homingState[index];
+  if (!state.active) return;
+
+  const uint32_t nowMs = millis();
+  const uint32_t phaseElapsedMs = nowMs - state.phaseStartMs;
+
+  const float    STALL_BLUNT_A     = homingStallA_blunt[index];
+  const float    STALL_PRECISE_A   = homingStallA_precise[index];
+  const uint32_t BRAKE_BLANK_MS    = homingBrakeBlankMs[index];
+  const uint32_t STALL_DEBOUNCE_MS = homingStallDebounceMs[index];
+  const uint32_t SAMPLE_MS         = homingSampleMs[index];
+
+  const uint8_t  UNSTICK_DUTY       = homingUnstickDuty[index];
+  const uint32_t UNSTICK_MS         = homingUnstickMs[index];
+  const int      UNSTICK_MIN_COUNTS = homingUnstickMinCounts[index];
+
+  const uint8_t  BLUNT_DUTY         = homingBluntDuty[index];
+  const int      BLUNT_BACKOFF      = homingBluntBackoffCounts[index];
+  const uint32_t BLUNT_BACKOFF_MS   = homingBluntBackoffTimeoutMs[index];
+
+  const uint8_t  PRECISE_DUTY       = homingPreciseDuty[index];
+  const uint32_t PRECISE_TIMEOUT_MS = homingPreciseTimeoutMs[index];
+  const int      TOUCH_BACKOFF      = homingTouchBackoffCounts[index];
+  const uint32_t TOUCH_BACKOFF_MS   = homingTouchBackoffTimeoutMs[index];
+
+  const uint32_t MID_TIMEOUT_MS     = homingMidTimeoutMs[index];
+  const int      MID_TOL_COUNTS     = homingMidTolCounts[index];
+
+  constexpr int DIR_LOW  = -1;
+  constexpr int DIR_HIGH = +1;
+
+  switch (state.phase) {
+    case HOMING_VREF_SETTLE:
+      if (phaseElapsedMs >= VREF_SETTLE_MS) {
+        Serial.print("M"); Serial.print(index); Serial.println(" Step 1: Unstick");
+        setDriveCoast(index, +1, UNSTICK_DUTY);
+        enterHomingPhase(index, HOMING_STEP1_UNSTICK_FWD);
+      }
+      break;
+
+    case HOMING_STEP1_UNSTICK_FWD:
+      if (homingMotionReached(index, +1, UNSTICK_MIN_COUNTS)) {
+        stopMotor(index);
+        Serial.print("M"); Serial.print(index); Serial.println(" Step 2: Blunt Low");
+        setDriveCoast(index, DIR_LOW, BLUNT_DUTY);
+        enterHomingPhase(index, HOMING_STEP2_BLUNT_LOW);
+      } else if (phaseElapsedMs >= UNSTICK_MS) {
+        stopMotor(index);
+        setDriveCoast(index, -1, UNSTICK_DUTY);
+        enterHomingPhase(index, HOMING_STEP1_UNSTICK_REV);
+      }
+      break;
+
+    case HOMING_STEP1_UNSTICK_REV:
+      if (homingMotionReached(index, -1, UNSTICK_MIN_COUNTS)) {
+        stopMotor(index);
+        Serial.print("M"); Serial.print(index); Serial.println(" Step 2: Blunt Low");
+        setDriveCoast(index, DIR_LOW, BLUNT_DUTY);
+        enterHomingPhase(index, HOMING_STEP2_BLUNT_LOW);
+      } else if (phaseElapsedMs >= UNSTICK_MS) {
+        finishHomingMotor(index, false, "could not unstick");
+      }
+      break;
+
+    case HOMING_STEP2_BLUNT_LOW:
+      if (homingStallDetectedNonBlocking(index, STALL_BLUNT_A, STALL_DEBOUNCE_MS, SAMPLE_MS,
+                                         homingBluntTimeoutLowMs[index], 0)) {
+        stopMotor(index);
+        setDriveCoast(index, -DIR_LOW, BLUNT_DUTY);
+        enterHomingPhase(index, HOMING_STEP2_BACKOFF_LOW);
+      } else if (phaseElapsedMs >= homingBluntTimeoutLowMs[index]) {
+        finishHomingMotor(index, false, "blunt low timeout");
+      }
+      break;
+
+    case HOMING_STEP2_BACKOFF_LOW:
+      if (homingMotionReached(index, -DIR_LOW, BLUNT_BACKOFF) || phaseElapsedMs >= BLUNT_BACKOFF_MS) {
+        stopMotor(index);
+        Serial.print("M"); Serial.print(index); Serial.println(" Step 3: Precise Low");
+        setDriveBrake(index, DIR_LOW, PRECISE_DUTY);
+        enterHomingPhase(index, HOMING_STEP3_PRECISE_LOW_DRIVE);
+      }
+      break;
+
+    case HOMING_STEP3_PRECISE_LOW_DRIVE:
+      if (homingStallDetectedNonBlocking(index, STALL_PRECISE_A, STALL_DEBOUNCE_MS, SAMPLE_MS,
+                                         PRECISE_TIMEOUT_MS, BRAKE_BLANK_MS)) {
+        stopMotor(index);
+        state.lowSamples[state.touchRepeatIndex] = encoders[index]->read();
+
+        if ((state.touchRepeatIndex + 1) >= state.touchRepeatTarget) {
+          state.lowEnd = (state.touchRepeatTarget == 3)
+            ? median3(state.lowSamples[0], state.lowSamples[1], state.lowSamples[2])
+            : ((state.touchRepeatTarget > 1) ? trimmedMean(state.lowSamples, state.touchRepeatTarget)
+                                             : state.lowSamples[0]);
+          lowROM[index] = state.lowEnd;
+
+          Serial.print("M"); Serial.print(index); Serial.println(" Step 4: Blunt High");
+          setDriveCoast(index, DIR_HIGH, BLUNT_DUTY);
+          enterHomingPhase(index, HOMING_STEP4_BLUNT_HIGH);
+        } else {
+          state.touchRepeatIndex++;
+          setDriveCoast(index, -DIR_LOW, max((int)PRECISE_DUTY, 15));
+          enterHomingPhase(index, HOMING_STEP3_PRECISE_LOW_BACKOFF);
+        }
+      } else if (phaseElapsedMs >= PRECISE_TIMEOUT_MS) {
+        finishHomingMotor(index, false, "precise low timeout");
+      }
+      break;
+
+    case HOMING_STEP3_PRECISE_LOW_BACKOFF:
+      if (homingMotionReached(index, -DIR_LOW, TOUCH_BACKOFF) || phaseElapsedMs >= TOUCH_BACKOFF_MS) {
+        stopMotor(index);
+        enterHomingPhase(index, HOMING_STEP3_PRECISE_LOW_SETTLE);
+      }
+      break;
+
+    case HOMING_STEP3_PRECISE_LOW_SETTLE:
+      if (phaseElapsedMs >= HOMING_TOUCH_SETTLE_MS) {
+        setDriveBrake(index, DIR_LOW, PRECISE_DUTY);
+        enterHomingPhase(index, HOMING_STEP3_PRECISE_LOW_DRIVE);
+      }
+      break;
+
+    case HOMING_STEP4_BLUNT_HIGH:
+      if (homingStallDetectedNonBlocking(index, STALL_BLUNT_A, STALL_DEBOUNCE_MS, SAMPLE_MS,
+                                         homingBluntTimeoutHighMs[index], 0)) {
+        stopMotor(index);
+        setDriveCoast(index, -DIR_HIGH, max(20, (int)BLUNT_DUTY - 30));
+        enterHomingPhase(index, HOMING_STEP4_BACKOFF_HIGH);
+      } else if (phaseElapsedMs >= homingBluntTimeoutHighMs[index]) {
+        finishHomingMotor(index, false, "blunt high timeout");
+      }
+      break;
+
+    case HOMING_STEP4_BACKOFF_HIGH:
+      if (homingMotionReached(index, -DIR_HIGH, BLUNT_BACKOFF) || phaseElapsedMs >= BLUNT_BACKOFF_MS) {
+        stopMotor(index);
+        Serial.print("M"); Serial.print(index); Serial.println(" Step 5: Precise High");
+        state.touchRepeatIndex = 0;
+        setDriveBrake(index, DIR_HIGH, PRECISE_DUTY);
+        enterHomingPhase(index, HOMING_STEP5_PRECISE_HIGH_DRIVE);
+      }
+      break;
+
+    case HOMING_STEP5_PRECISE_HIGH_DRIVE:
+      if (homingStallDetectedNonBlocking(index, STALL_PRECISE_A, STALL_DEBOUNCE_MS, SAMPLE_MS,
+                                         PRECISE_TIMEOUT_MS, BRAKE_BLANK_MS)) {
+        stopMotor(index);
+        state.highSamples[state.touchRepeatIndex] = encoders[index]->read();
+
+        if ((state.touchRepeatIndex + 1) >= state.touchRepeatTarget) {
+          state.highEnd = (state.touchRepeatTarget == 3)
+            ? median3(state.highSamples[0], state.highSamples[1], state.highSamples[2])
+            : ((state.touchRepeatTarget > 1) ? trimmedMean(state.highSamples, state.touchRepeatTarget)
+                                             : state.highSamples[0]);
+          highROM[index] = state.highEnd;
+
+          const long mid = (state.lowEnd + state.highEnd) / 2;
+          Serial.print("M"); Serial.print(index); Serial.print(" Step 6: Move to midpoint = ");
+          Serial.println(mid);
+
+          integ[index] = 0.0f;
+          prevErr[index] = 0;
+          noInterrupts();
+          posTarget[index] = mid;
+          interrupts();
+          ControlMode[index] = MODE_POS;
+          enterHomingPhase(index, HOMING_STEP6_MOVE_MID);
+        } else {
+          state.touchRepeatIndex++;
+          setDriveCoast(index, -DIR_HIGH, max((int)PRECISE_DUTY, 15));
+          enterHomingPhase(index, HOMING_STEP5_PRECISE_HIGH_BACKOFF);
+        }
+      } else if (phaseElapsedMs >= PRECISE_TIMEOUT_MS) {
+        finishHomingMotor(index, false, "precise high timeout");
+      }
+      break;
+
+    case HOMING_STEP5_PRECISE_HIGH_BACKOFF:
+      if (homingMotionReached(index, -DIR_HIGH, TOUCH_BACKOFF) || phaseElapsedMs >= TOUCH_BACKOFF_MS) {
+        stopMotor(index);
+        enterHomingPhase(index, HOMING_STEP5_PRECISE_HIGH_SETTLE);
+      }
+      break;
+
+    case HOMING_STEP5_PRECISE_HIGH_SETTLE:
+      if (phaseElapsedMs >= HOMING_TOUCH_SETTLE_MS) {
+        setDriveBrake(index, DIR_HIGH, PRECISE_DUTY);
+        enterHomingPhase(index, HOMING_STEP5_PRECISE_HIGH_DRIVE);
+      }
+      break;
+
+    case HOMING_STEP6_MOVE_MID: {
+      const long mid = (state.lowEnd + state.highEnd) / 2;
+      const int32_t err = mid - (int32_t)encoders[index]->read();
+
+      if (abs(err) <= MID_TOL_COUNTS) {
+        finishHomingMotor(index, true, "done");
+      } else if (phaseElapsedMs >= MID_TIMEOUT_MS) {
+        finishHomingMotor(index, false, "midpoint timeout");
+      }
+      break;
+    }
+
+    case HOMING_IDLE:
+    default:
+      break;
+  }
+}
+
+void updateHomingSequence() {
+  bool anyActive = false;
+
+  for (int i = 0; i < 6; i++) {
+    if (!homingState[i].active) {
+      continue;
+    }
+
+    anyActive = true;
+    updateHomingMotor(i);
+  }
+
+  if (homingActive && !anyActive) {
+    homingActive = false;
+    Serial.println("Homing sequence complete");
+  } else if (anyActive) {
+    homingActive = true;
+  }
 }
 
 
@@ -667,22 +1223,37 @@ void printMotorDiagnostics() {
   Serial.println(lastVrefDuty);
 }
 
-static void loadPwmArray(uint8_t *target, const CAN_message_t &msg) {
-  const uint8_t count = min<uint8_t>(6, msg.len);
-  for (uint8_t i = 0; i < count; ++i) target[i] = msg.buf[i];
+void printPositionControllerDiagnostics() {
+  // Snapshot targets atomically (even if you also snapshot elsewhere, this is self-contained)
+  int32_t t[6];
+  noInterrupts();
+  for (int i = 0; i < 6; i++) t[i] = posTarget[i];
+  interrupts();
+
+  Serial.print("POS CTRL (age ");
+  Serial.print((uint32_t)posTargetsUpdatedAgeMs);
+  Serial.println(" ms)");
+
+  for (int i = 0; i < 6; i++) {
+    const int32_t pos = (int32_t)encoders[i]->read();
+    const int32_t err = t[i] - pos;
+
+    Serial.print("M"); Serial.print(i);
+    Serial.print(": tgt="); Serial.print(t[i]);
+    Serial.print(" pos="); Serial.print(pos);
+    Serial.print(" err="); Serial.print(err);
+    Serial.println();
+  }
 }
 
 void sendEncoderPositions() {
   for (int i = 0; i < 6; i++) {
     CAN_message_t msg;
-    msg.id = CAN_ID_ENCODER_BASE + i;
+    msg.id  = CAN_ID_ENCODER_BASE + i;
     msg.len = 4;
-    long pos = encoders[i]->read();
 
-    msg.buf[0] = (pos >> 24) & 0xFF;
-    msg.buf[1] = (pos >> 16) & 0xFF;
-    msg.buf[2] = (pos >> 8) & 0xFF;
-    msg.buf[3] = pos & 0xFF;
+    int32_t pos = (int32_t)encoders[i]->read();
+    pack_i32_le(msg.buf, pos);  
 
     Can3.write(msg);
   }
@@ -694,95 +1265,87 @@ void sendRangeOfMotion() {
     msg.id = CAN_ID_ROM_BASE + i;
     msg.len = 8;
 
-    msg.buf[0] = (lowROM[i] >> 24) & 0xFF;
-    msg.buf[1] = (lowROM[i] >> 16) & 0xFF;
-    msg.buf[2] = (lowROM[i] >> 8) & 0xFF;
-    msg.buf[3] = lowROM[i] & 0xFF;
-
-    msg.buf[4] = (highROM[i] >> 24) & 0xFF;
-    msg.buf[5] = (highROM[i] >> 16) & 0xFF;
-    msg.buf[6] = (highROM[i] >> 8) & 0xFF;
-    msg.buf[7] = highROM[i] & 0xFF;
+    pack_i32_le(&msg.buf[0], (int32_t)lowROM[i]);
+    pack_i32_le(&msg.buf[4], (int32_t)highROM[i]);
 
     Can3.write(msg);
   }
 }
 
-// direction: +1 or -1
-//Currently Unused. MotorHomingSoftStart is being used instead.
-void driveMotorHoming(int index, int direction) {
-  int duty = map(homingSpeeds[index], 0, 100, 0, 255);
-  duty = constrain(duty, 0, 255);
-
-  Serial.print("Current Homing Speed ");
-  Serial.println(duty);
-
-  if (direction > 0) {
-    PWM_A[index] = duty;
-    PWM_B[index] = 0;
-  } else if (direction < 0) {
-    PWM_A[index] = 0;
-    PWM_B[index] = duty;
-  } else {
-    PWM_A[index] = 0;
-    PWM_B[index] = 0;
-  }
-
-  controlMotor(index);
+static inline uint8_t applyMinDuty(uint8_t duty, uint8_t minDuty) {
+  if (duty == 0) return 0;
+  return (duty < minDuty) ? minDuty : duty;
 }
 
-// direction: +1 or -1
-void driveMotorHomingSoftStart(int index, int direction, int targetDuty, uint32_t rampMs) {
-  targetDuty = constrain(targetDuty, 0, 255);
+// Call this periodically (e.g., every 5ms) when MODE_POS
+void updatePositionController(int index, float dt_s) {
+  // Snapshot target atomically (CAN ISR updates it)
+  int32_t tgt;
+  noInterrupts();
+  tgt = posTarget[index];
+  interrupts();
 
-  // Ensure we start from 0 duty
-  PWM_A[index] = 0;
-  PWM_B[index] = 0;
-  controlMotor(index);
+  //Crude ROM clamping
+  const int32_t lo = (int32_t)lowROM[index];
+  const int32_t hi = (int32_t)highROM[index];
 
-  const uint32_t t0 = millis();
+  if (tgt < lo) tgt = lo;
+  if (tgt > hi) tgt = hi;
 
-  // Linear ramp 0 -> targetDuty over rampMs
-  while (millis() - t0 < rampMs) {
-    const uint32_t dt = millis() - t0;
-    const int duty = (int)((uint32_t)targetDuty * dt / rampMs);
+  const int32_t pos = (int32_t)encoders[index]->read();
+  const int32_t err = tgt - pos;
 
-    if (direction > 0) {
-      PWM_A[index] = duty;
-      PWM_B[index] = 0;
-    } else if (direction < 0) {
-      PWM_A[index] = 0;
-      PWM_B[index] = duty;
-    } else {
-      PWM_A[index] = 0;
-      PWM_B[index] = 0;
-    }
-
+  // Deadband = behave like a servo: "good enough" -> stop
+  if (abs(err) <= posDeadbandCounts[index]) {
+    // Stop motor in coast
+    PWM_A[index] = 0;
+    PWM_B[index] = 0;
     controlMotor(index);
-  }
 
-  // Hold final target
-  if (direction > 0) {
-    PWM_A[index] = targetDuty;
-    PWM_B[index] = 0;
-  } else if (direction < 0) {
-    PWM_A[index] = 0;
-    PWM_B[index] = targetDuty;
-  } else {
-    PWM_A[index] = 0;
-    PWM_B[index] = 0;
+    // Optional: keep integrator from winding (PI-ready)
+    prevErr[index] = err;
+    return;
   }
+  //------------------
+  // --- PID form  ---
+  //------------------
+  // P
+  float u = Kp[index] * (float)err;
 
-  controlMotor(index);
+  // I (not used yet, but ready)
+   integ[index] += (float)err * dt_s;
+   u += Ki[index] * integ[index];
+
+  // D (not used yet, but ready)
+  // const float derr = ((float)err - (float)prevErr[index]) / dt_s;
+  // u += Kd[index] * derr;
+
+  prevErr[index] = err;
+
+  // Convert control effort -> signed duty command
+  // u is "duty-ish". Clamp to [-posMaxDuty, +posMaxDuty]
+  const float umax = (float)posMaxDuty[index];
+  if (u >  umax) u =  umax;
+  if (u < -umax) u = -umax;
+
+  const int dir = (u >= 0.0f) ? +1 : -1;
+  uint8_t duty = (uint8_t)abs((int)u);
+
+  // Apply minimum duty to overcome stiction (servo-like)
+  duty = applyMinDuty(duty, posMinDuty[index]);
+
+  // Drive using your existing coast mode
+  setDriveCoast(index, dir, duty);
 }
 
-void homeMotor(int index) {
+#if 0
+// Legacy blocking homing path kept only as reference while the non-blocking
+// state machine is being tuned. It is no longer called by loop() or CAN.
+[[maybe_unused]] static void homeMotor(int index) {
   Serial.print("Homing motor ");
   Serial.println(index);
 
-  // ------------------------------
   // Pull per-motor parameters
-  // ------------------------------
   const float    STALL_BLUNT_A     = homingStallA_blunt[index];
   const float    STALL_PRECISE_A   = homingStallA_precise[index];
   const uint32_t BRAKE_BLANK_MS    = homingBrakeBlankMs[index];
@@ -795,13 +1358,14 @@ void homeMotor(int index) {
 
   const uint8_t  BLUNT_DUTY         = homingBluntDuty[index];
   const int      BLUNT_BACKOFF      = homingBluntBackoffCounts[index];
+  const uint32_t BLUNT_BACKOFF_MS   = homingBluntBackoffTimeoutMs[index];
 
   const uint8_t  PRECISE_DUTY       = homingPreciseDuty[index];
   const uint32_t PRECISE_TIMEOUT_MS = homingPreciseTimeoutMs[index];
   int            TOUCH_REPEATS      = (int)homingTouchRepeats[index];
   const int      TOUCH_BACKOFF      = homingTouchBackoffCounts[index];
+  const uint32_t TOUCH_BACKOFF_MS   = homingTouchBackoffTimeoutMs[index];
 
-  const uint8_t  MID_DUTY           = homingMidDuty[index];
   const uint32_t MID_TIMEOUT_MS     = homingMidTimeoutMs[index];
   const int      MID_TOL_COUNTS     = homingMidTolCounts[index];
 
@@ -814,23 +1378,17 @@ void homeMotor(int index) {
   const int DIR_LOW  = -1;
   const int DIR_HIGH = +1;
 
-  // ------------------------------
   // NOTE: nFAULT is intentionally ignored during homing (no pre-clear / no abort-on-fault)
-  // ------------------------------
 
-  // ------------------------------
   // Set homing current limit (VREF) and settle
-  // ------------------------------
   setVrefDuty(homingVoltage[index]);
   delay(VREF_SETTLE_MS);
-
-  // ------------------------------
-  // Homing helper functions are global (stall detect, backoff, median/trimmed mean)
-  // ------------------------------
+  ControlMode[index] = MODE_PWM; //Switching over to open loop PWM control for homing
 
   // ------------------------------
   // Step 1: Unstick
   // ------------------------------
+
   Serial.println("Step 1: Unstick");
   setDriveCoast(index, +1, UNSTICK_DUTY);
   bool moved = waitForMotionCounts(index, +1, UNSTICK_MIN_COUNTS, UNSTICK_MS);
@@ -845,6 +1403,7 @@ void homeMotor(int index) {
   if (!moved) {
     Serial.println("Abort: could not unstick (no encoder motion). ");
     setVrefDuty(NORMAL_VREF_DUTY);
+    enterPosModeHold(index);  
     return;
   }
 
@@ -862,11 +1421,12 @@ void homeMotor(int index) {
   if (!hitLow) {
     Serial.println("Abort: blunt low timeout (no stall detected). ");
     setVrefDuty(NORMAL_VREF_DUTY);
+    enterPosModeHold(index);
     return;
   }
 
   // Back off to create a known neighborhood
-  homingBackoffFrom(index, DIR_LOW, BLUNT_BACKOFF, BLUNT_DUTY);
+  homingBackoffFrom(index, DIR_LOW, BLUNT_BACKOFF, BLUNT_DUTY, BLUNT_BACKOFF_MS);
 
   // ------------------------------
   // Step 3: Precise Low End (drive–brake), optional multi-touch
@@ -883,6 +1443,7 @@ void homeMotor(int index) {
     if (!stalled) {
       Serial.println("Abort: precise low timeout (no stall detected). ");
       setVrefDuty(NORMAL_VREF_DUTY);
+      enterPosModeHold(index);
       return;
     }
 
@@ -893,7 +1454,7 @@ void homeMotor(int index) {
     Serial.print(":");
     Serial.println(lowSamples[k]);
 
-    homingBackoffFrom(index, DIR_LOW, TOUCH_BACKOFF, (uint8_t)max(15, (int)PRECISE_DUTY));
+    homingBackoffFrom(index, DIR_LOW, TOUCH_BACKOFF, (uint8_t)max(15, (int)PRECISE_DUTY), TOUCH_BACKOFF_MS);
     delay(25);
   }
 
@@ -919,10 +1480,11 @@ void homeMotor(int index) {
   if (!hitHigh) {
     Serial.println("Abort: blunt high timeout (no stall detected). ");
     setVrefDuty(NORMAL_VREF_DUTY);
+    enterPosModeHold(index);
     return;
   }
 
-  homingBackoffFrom(index, DIR_HIGH, BLUNT_BACKOFF, (uint8_t)max(20, (int)BLUNT_DUTY - 30));
+  homingBackoffFrom(index, DIR_HIGH, BLUNT_BACKOFF, (uint8_t)max(20, (int)BLUNT_DUTY - 30), BLUNT_BACKOFF_MS);
 
   // ------------------------------
   // Step 5: Precise High End (drive–brake), optional multi-touch
@@ -939,6 +1501,7 @@ void homeMotor(int index) {
     if (!stalled) {
       Serial.println("Abort: precise high timeout (no stall detected). ");
       setVrefDuty(NORMAL_VREF_DUTY);
+      enterPosModeHold(index);
       return;
     }
 
@@ -949,7 +1512,7 @@ void homeMotor(int index) {
     Serial.print(":");
     Serial.println(highSamples[k]);
 
-    homingBackoffFrom(index, DIR_HIGH, TOUCH_BACKOFF, (uint8_t)max(15, (int)PRECISE_DUTY));
+    homingBackoffFrom(index, DIR_HIGH, TOUCH_BACKOFF, (uint8_t)max(15, (int)PRECISE_DUTY), TOUCH_BACKOFF_MS);
     delay(25);
   }
 
@@ -968,20 +1531,41 @@ void homeMotor(int index) {
   const long mid = (lowEnd + highEnd) / 2;
   Serial.print("Step 6: Move to midpoint = ");
   Serial.println(mid);
+  ControlMode[index] = MODE_POS;  // Ensure we leave homing in position mode
 
+  posTarget[index] = mid;
+
+  // Run the POS controller until centered or timeout
+  bool centered = false;
   const uint32_t t0 = millis();
+  uint32_t lastUs = micros();
+
   while (millis() - t0 < MID_TIMEOUT_MS) {
-    const long pos = encoders[index]->read();
-    const long err = mid - pos;
+    const uint32_t nowUs = micros();
+    const float dt_s = (nowUs - lastUs) * 1e-6f;
+    lastUs = nowUs;
 
-    if (labs(err) <= MID_TOL_COUNTS) break;
+    // Run your servo-like loop
+    updatePositionController(index, dt_s);
 
-    const int dir = (err > 0) ? +1 : -1;
-    setDriveCoast(index, dir, MID_DUTY);
-    delay(10);
+    // Check if we’re “close enough”
+    const int32_t pos = (int32_t)encoders[index]->read();
+    const int32_t err = mid - pos;
+    if (abs(err) <= MID_TOL_COUNTS) {
+      centered = true;
+      break;
+    }
+
+    // Keep loop from hogging CPU / spamming encoder reads
+    delayMicroseconds(2000); // ~500 Hz-ish
   }
 
-  stopMotor(index);
+  if (!centered) {
+    Serial.println("Abort: midpoint move timeout (POS mode).");
+    setVrefDuty(NORMAL_VREF_DUTY);
+    enterPosModeHold(index);
+    return;
+  }
 
   // Restore normal VREF
   setVrefDuty(NORMAL_VREF_DUTY);
@@ -993,4 +1577,5 @@ void homeMotor(int index) {
   Serial.print(" mid=");
   Serial.println(mid);
 }
+#endif
 
