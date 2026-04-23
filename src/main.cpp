@@ -106,7 +106,7 @@ volatile bool homingActive = false;
 
 // Which motors to home when a homing command is received.
 // All listed motors run through the non-blocking 6-step homing state machine.
-constexpr int HOMING_SEQUENCE[] = {0, 2};
+constexpr int HOMING_SEQUENCE[] = {1};
 constexpr int HOMING_SEQUENCE_LEN = (int)(sizeof(HOMING_SEQUENCE) / sizeof(HOMING_SEQUENCE[0]));
 
 // ----------- Global ROM limits for Motor Limits ----------- //
@@ -125,6 +125,9 @@ volatile int32_t posTarget[6] = {0,0,0,0,0,0};
 // NEW: flags for safe printing outside ISR
 volatile bool posTargetsUpdated = false;
 elapsedMillis posTargetsUpdatedAgeMs;  // time since last update
+volatile bool ignoreCanPosTargets = false;
+elapsedMillis ignoreCanPosTargetsAgeMs;
+static constexpr uint32_t HOMING_CAN_POS_HOLDOFF_MS = 10000;
 
 
 // Incoming commands from brain (0..255 like old analogWrite)
@@ -146,8 +149,8 @@ enum ControlMode_t { MODE_POS = 0, MODE_PWM = 1 };
 volatile ControlMode_t ControlMode[6] = { MODE_POS, MODE_POS, MODE_POS, MODE_POS, MODE_POS, MODE_POS };
 
 // Per-motor gains (start with small Kp; Ki/Kd = 0 for now)
-float Kp[6] = { 0.15f, 0.050f, 0.150f, 0.050f, 0.050f, 0.050f };
-float Ki[6] = { 0.001f,   0.001f,   0.001f,   0.0f,   0.0f,   0.0f   };
+float Kp[6] = { 0.15f, 0.050f, 0.15f, 0.050f, 0.15f, 0.050f };
+float Ki[6] = { 0.001f, 0.001f, 0.001f, 0.001f, 0.001f, 0.001f };
 float Kd[6] = { 0.0f,   0.0f,   0.0f,   0.0f,   0.0f,   0.0f   };
 
 // Controller memory (for PI/PID later)
@@ -156,8 +159,8 @@ int32_t prevErr[6] = {0,0,0,0,0,0};
 
 // Output shaping
 int32_t posDeadbandCounts[6] = { 10, 10, 10, 10, 10, 10 };   // within this, command 0
-uint8_t posMaxDuty[6]        = { 250, 255, 255, 255, 255, 255};  // clamp output
-uint8_t posMinDuty[6]        = { 50, 115, 90, 60, 90, 60 };   // overcome static friction (0 disables)
+uint8_t posMaxDuty[6]        = { 255, 255, 255, 255, 255, 255};  // clamp output
+uint8_t posMinDuty[6]        = { 50, 115, 50, 115, 50, 115 };   // overcome static friction (0 disables)
 
 // =============================
 // Homing Constants Setup
@@ -166,44 +169,45 @@ uint8_t posMinDuty[6]        = { 50, 115, 90, 60, 90, 60 };   // overcome static
 // Stall detection thresholds [Amps]
 // NOTE: Drive–Brake tends to produce higher average IPROPI/current than Drive–Coast at the same mechanical load.
 // So we allow separate thresholds for BLUNT (drive–coast) vs PRECISE (drive–brake).
-float homingStallA_blunt[6]   = { 0.30f, 0.10f, 0.30f, 0.20f, 0.30f, 0.20f };
-float homingStallA_precise[6] = { 0.20f, 0.20f, .20f, 0.50f, 0.20f, 0.50f };
+float homingStallA_blunt[6]   = { 0.20f, 0.30f, 0.20f, 0.15f, 0.20f, 0.15f };
+float homingStallA_precise[6] = { 0.30f, 0.40f, 0.30f, 0.20f, 0.30f, 0.20f };
 
 // Ignore current sensing for a short time after entering drive–brake to avoid immediate false "stall" due to braking current spikes.
-uint32_t homingBrakeBlankMs[6] = { 50, 50, 50, 50, 50, 50 };
+uint32_t homingBrakeBlankMs[6] = { 100, 100, 100, 100, 100, 100 };
 
 // Stall debounce time [ms]
-uint32_t homingStallDebounceMs[6] = { 100, 100, 100, 100, 100, 100 };
+uint32_t homingStallDebounceMs[6] = { 30, 30, 30, 30, 30, 30 };
 
 // Current sample period during homing [ms]
 uint32_t homingSampleMs[6] = { 5, 5, 5, 5, 5, 5 };
 
 // Unstick phase
-uint8_t  homingUnstickDuty[6]      = {200, 200, 200, 200, 200, 200 };
+uint8_t  homingUnstickDuty[6]      = { 200, 200, 200, 200, 200, 200 };
 uint32_t homingUnstickMs[6]        = { 3000, 3000, 3000, 3000, 3000, 3000 };
 int      homingUnstickMinCounts[6] = { 100, 100, 100, 100, 100, 100 };
 
 // Homing timeouts [ms] (Per motor)
 // Blunt (drive–coast) search windows for LOW and HIGH ends.
-uint32_t homingBluntTimeoutLowMs[6]  = { 12000, 12000, 12000, 12000, 12000, 12000 };
-uint32_t homingBluntTimeoutHighMs[6] = { 12000, 12000, 12000, 12000, 12000, 12000 };
+uint32_t homingBluntTimeoutLowMs[6]  = { 12000, 20000, 12000, 20000, 12000, 20000 };
+uint32_t homingBluntTimeoutHighMs[6] = { 12000, 20000, 12000, 20000, 12000, 20000 };
 
 
 // Blunt seek (drive–coast)
-uint8_t homingBluntDuty[6] = { 220, 180, 220, 220, 220, 220 };
+uint8_t homingBluntDuty[6] = { 140, 160, 140, 160, 140, 160 };
 
 // Backoff distances [encoder counts]
-int homingBluntBackoffCounts[6] = { 1000, 5000, 1000, 2000, 1000, 4000 };
-int homingTouchBackoffCounts[6] = { 800, 7000, 800, 3000, 800, 5000 };
+int homingBluntBackoffCounts[6] = { 3000, 5000, 3000, 5000, 3000, 5000 };
+int homingTouchBackoffCounts[6] = { 3000, 9000, 3000, 9000, 3000, 9000 };
 
 // Backoff timeouts [ms]
 // Motors 1/3/5 use larger backoff distances and need longer windows to fully clear the stop.
-uint32_t homingBluntBackoffTimeoutMs[6] = { 1000, 2500, 1000, 2500, 1000, 3500 };
-uint32_t homingTouchBackoffTimeoutMs[6] = { 1000, 3500, 1000, 3000, 1000, 4500 };
+uint32_t homingBluntBackoffTimeoutMs[6] = { 2000, 2500, 2000, 2500, 2000, 2500 };
+uint32_t homingTouchBackoffTimeoutMs[6] = { 2000, 4500, 2000, 4500, 2000, 4500 };
+uint8_t homingTouchBackoffDuty[6] = { 250, 255, 250, 255, 250, 255 };
 
 // Precise touch-off (drive–brake)
-uint8_t  homingPreciseDuty[6]      = { 200, 200, 200, 200, 200, 220 };
-uint32_t homingPreciseTimeoutMs[6] = { 1600, 1600, 1600, 1600, 1600, 1600 };
+uint8_t  homingPreciseDuty[6]      = { 140, 200, 140, 200, 140, 200 };
+uint32_t homingPreciseTimeoutMs[6] = { 3200, 3200, 3200, 3200, 3200, 3200 };
 uint8_t  homingTouchRepeats[6]     = { 3, 3, 3, 3, 3, 3 };
 
 // Midpoint move
@@ -403,6 +407,11 @@ void loop() {
   Can3.events();
   updateHomingSequence();
 
+  if (ignoreCanPosTargets && !homingActive && ignoreCanPosTargetsAgeMs >= HOMING_CAN_POS_HOLDOFF_MS) {
+    ignoreCanPosTargets = false;
+    Serial.println("CAN position target updates resumed");
+  }
+
   static unsigned long lastSend = 0;
   if (millis() - lastSend >= 100) {
     sendEncoderPositions();
@@ -470,7 +479,7 @@ void handleCAN(const CAN_message_t &msg) {
     }
 
     case CAN_ID_SET_POS_01: {
-      if (msg.len == 8) {
+      if (!ignoreCanPosTargets && msg.len == 8) {
         posTarget[0] = unpack_i32_le(&msg.buf[0]);
         posTarget[1] = unpack_i32_le(&msg.buf[4]);
         posTargetsUpdated = true;
@@ -480,7 +489,7 @@ void handleCAN(const CAN_message_t &msg) {
     }
 
     case CAN_ID_SET_POS_23: {
-      if (msg.len == 8) {
+      if (!ignoreCanPosTargets && msg.len == 8) {
         posTarget[2] = unpack_i32_le(&msg.buf[0]);
         posTarget[3] = unpack_i32_le(&msg.buf[4]);
         posTargetsUpdated = true;
@@ -490,7 +499,7 @@ void handleCAN(const CAN_message_t &msg) {
     }
 
     case CAN_ID_SET_POS_45: {
-      if (msg.len == 8) {
+      if (!ignoreCanPosTargets && msg.len == 8) {
         posTarget[4] = unpack_i32_le(&msg.buf[0]);
         posTarget[5] = unpack_i32_le(&msg.buf[4]);
         posTargetsUpdated = true;
@@ -919,6 +928,8 @@ static void finishHomingMotor(int index, bool success, const char *message) {
     Serial.println((lowROM[index] + highROM[index]) / 2);
   }
 
+  ignoreCanPosTargets = true;
+  ignoreCanPosTargetsAgeMs = 0;
   refreshHomingVref();
   sendRangeOfMotion();
 }
@@ -929,6 +940,8 @@ void startHomingMotor(int index) {
   state = HomingState{};
   state.active = true;
   state.touchRepeatTarget = (uint8_t)homingTouchRepeatsClamped(index);
+  ignoreCanPosTargets = true;
+  ignoreCanPosTargetsAgeMs = 0;
 
   ControlMode[index] = MODE_PWM;
   stopMotor(index);
@@ -977,11 +990,13 @@ void updateHomingMotor(int index) {
   const uint8_t  BLUNT_DUTY         = homingBluntDuty[index];
   const int      BLUNT_BACKOFF      = homingBluntBackoffCounts[index];
   const uint32_t BLUNT_BACKOFF_MS   = homingBluntBackoffTimeoutMs[index];
+  const uint8_t  BLUNT_BACKOFF_DUTY = 255;
 
   const uint8_t  PRECISE_DUTY       = homingPreciseDuty[index];
   const uint32_t PRECISE_TIMEOUT_MS = homingPreciseTimeoutMs[index];
   const int      TOUCH_BACKOFF      = homingTouchBackoffCounts[index];
   const uint32_t TOUCH_BACKOFF_MS   = homingTouchBackoffTimeoutMs[index];
+  const uint8_t  TOUCH_BACKOFF_DUTY = homingTouchBackoffDuty[index];
 
   const uint32_t MID_TIMEOUT_MS     = homingMidTimeoutMs[index];
   const int      MID_TOL_COUNTS     = homingMidTolCounts[index];
@@ -1002,7 +1017,7 @@ void updateHomingMotor(int index) {
       if (homingMotionReached(index, +1, UNSTICK_MIN_COUNTS)) {
         stopMotor(index);
         Serial.print("M"); Serial.print(index); Serial.println(" Step 2: Blunt Low");
-        setDriveCoast(index, DIR_LOW, BLUNT_DUTY);
+        setDriveBrake(index, DIR_LOW, BLUNT_DUTY);
         enterHomingPhase(index, HOMING_STEP2_BLUNT_LOW);
       } else if (phaseElapsedMs >= UNSTICK_MS) {
         stopMotor(index);
@@ -1015,7 +1030,7 @@ void updateHomingMotor(int index) {
       if (homingMotionReached(index, -1, UNSTICK_MIN_COUNTS)) {
         stopMotor(index);
         Serial.print("M"); Serial.print(index); Serial.println(" Step 2: Blunt Low");
-        setDriveCoast(index, DIR_LOW, BLUNT_DUTY);
+        setDriveBrake(index, DIR_LOW, BLUNT_DUTY);
         enterHomingPhase(index, HOMING_STEP2_BLUNT_LOW);
       } else if (phaseElapsedMs >= UNSTICK_MS) {
         finishHomingMotor(index, false, "could not unstick");
@@ -1024,9 +1039,12 @@ void updateHomingMotor(int index) {
 
     case HOMING_STEP2_BLUNT_LOW:
       if (homingStallDetectedNonBlocking(index, STALL_BLUNT_A, STALL_DEBOUNCE_MS, SAMPLE_MS,
-                                         homingBluntTimeoutLowMs[index], 0)) {
+                                         homingBluntTimeoutLowMs[index], BRAKE_BLANK_MS)) {
         stopMotor(index);
-        setDriveCoast(index, -DIR_LOW, BLUNT_DUTY);
+        Serial.print("M"); Serial.print(index);
+        Serial.print(" blunt low hit @ ");
+        Serial.println(encoders[index]->read());
+        setDriveCoast(index, -DIR_LOW, BLUNT_BACKOFF_DUTY);
         enterHomingPhase(index, HOMING_STEP2_BACKOFF_LOW);
       } else if (phaseElapsedMs >= homingBluntTimeoutLowMs[index]) {
         finishHomingMotor(index, false, "blunt low timeout");
@@ -1047,6 +1065,13 @@ void updateHomingMotor(int index) {
                                          PRECISE_TIMEOUT_MS, BRAKE_BLANK_MS)) {
         stopMotor(index);
         state.lowSamples[state.touchRepeatIndex] = encoders[index]->read();
+        Serial.print("M"); Serial.print(index);
+        Serial.print(" precise low sample ");
+        Serial.print(state.touchRepeatIndex + 1);
+        Serial.print("/");
+        Serial.print(state.touchRepeatTarget);
+        Serial.print(" @ ");
+        Serial.println(state.lowSamples[state.touchRepeatIndex]);
 
         if ((state.touchRepeatIndex + 1) >= state.touchRepeatTarget) {
           state.lowEnd = (state.touchRepeatTarget == 3)
@@ -1054,13 +1079,25 @@ void updateHomingMotor(int index) {
             : ((state.touchRepeatTarget > 1) ? trimmedMean(state.lowSamples, state.touchRepeatTarget)
                                              : state.lowSamples[0]);
           lowROM[index] = state.lowEnd;
-
-          Serial.print("M"); Serial.print(index); Serial.println(" Step 4: Blunt High");
-          setDriveCoast(index, DIR_HIGH, BLUNT_DUTY);
-          enterHomingPhase(index, HOMING_STEP4_BLUNT_HIGH);
+          Serial.print("M"); Serial.print(index);
+          Serial.print(" averaged low endpoint = ");
+          Serial.println(state.lowEnd);
+          state.touchRepeatIndex = state.touchRepeatTarget;
+          Serial.print("M"); Serial.print(index);
+          Serial.print(" final low-side exit backoff: duty=");
+          Serial.print(TOUCH_BACKOFF_DUTY);
+          Serial.print(" counts=");
+          Serial.println(TOUCH_BACKOFF);
+          setDriveCoast(index, -DIR_LOW, TOUCH_BACKOFF_DUTY);
+          enterHomingPhase(index, HOMING_STEP3_PRECISE_LOW_BACKOFF);
         } else {
           state.touchRepeatIndex++;
-          setDriveCoast(index, -DIR_LOW, max((int)PRECISE_DUTY, 15));
+          Serial.print("M"); Serial.print(index);
+          Serial.print(" hard backoff low: duty=");
+          Serial.print(TOUCH_BACKOFF_DUTY);
+          Serial.print(" counts=");
+          Serial.println(TOUCH_BACKOFF);
+          setDriveCoast(index, -DIR_LOW, TOUCH_BACKOFF_DUTY);
           enterHomingPhase(index, HOMING_STEP3_PRECISE_LOW_BACKOFF);
         }
       } else if (phaseElapsedMs >= PRECISE_TIMEOUT_MS) {
@@ -1071,7 +1108,13 @@ void updateHomingMotor(int index) {
     case HOMING_STEP3_PRECISE_LOW_BACKOFF:
       if (homingMotionReached(index, -DIR_LOW, TOUCH_BACKOFF) || phaseElapsedMs >= TOUCH_BACKOFF_MS) {
         stopMotor(index);
-        enterHomingPhase(index, HOMING_STEP3_PRECISE_LOW_SETTLE);
+        if (state.touchRepeatIndex >= state.touchRepeatTarget) {
+          Serial.print("M"); Serial.print(index); Serial.println(" Step 4: Blunt High");
+          setDriveBrake(index, DIR_HIGH, BLUNT_DUTY);
+          enterHomingPhase(index, HOMING_STEP4_BLUNT_HIGH);
+        } else {
+          enterHomingPhase(index, HOMING_STEP3_PRECISE_LOW_SETTLE);
+        }
       }
       break;
 
@@ -1084,9 +1127,12 @@ void updateHomingMotor(int index) {
 
     case HOMING_STEP4_BLUNT_HIGH:
       if (homingStallDetectedNonBlocking(index, STALL_BLUNT_A, STALL_DEBOUNCE_MS, SAMPLE_MS,
-                                         homingBluntTimeoutHighMs[index], 0)) {
+                                         homingBluntTimeoutHighMs[index], BRAKE_BLANK_MS)) {
         stopMotor(index);
-        setDriveCoast(index, -DIR_HIGH, max(20, (int)BLUNT_DUTY - 30));
+        Serial.print("M"); Serial.print(index);
+        Serial.print(" blunt high hit @ ");
+        Serial.println(encoders[index]->read());
+        setDriveCoast(index, -DIR_HIGH, BLUNT_BACKOFF_DUTY);
         enterHomingPhase(index, HOMING_STEP4_BACKOFF_HIGH);
       } else if (phaseElapsedMs >= homingBluntTimeoutHighMs[index]) {
         finishHomingMotor(index, false, "blunt high timeout");
@@ -1108,6 +1154,13 @@ void updateHomingMotor(int index) {
                                          PRECISE_TIMEOUT_MS, BRAKE_BLANK_MS)) {
         stopMotor(index);
         state.highSamples[state.touchRepeatIndex] = encoders[index]->read();
+        Serial.print("M"); Serial.print(index);
+        Serial.print(" precise high sample ");
+        Serial.print(state.touchRepeatIndex + 1);
+        Serial.print("/");
+        Serial.print(state.touchRepeatTarget);
+        Serial.print(" @ ");
+        Serial.println(state.highSamples[state.touchRepeatIndex]);
 
         if ((state.touchRepeatIndex + 1) >= state.touchRepeatTarget) {
           state.highEnd = (state.touchRepeatTarget == 3)
@@ -1115,8 +1168,41 @@ void updateHomingMotor(int index) {
             : ((state.touchRepeatTarget > 1) ? trimmedMean(state.highSamples, state.touchRepeatTarget)
                                              : state.highSamples[0]);
           highROM[index] = state.highEnd;
+          Serial.print("M"); Serial.print(index);
+          Serial.print(" averaged high endpoint = ");
+          Serial.println(state.highEnd);
 
+          state.touchRepeatIndex = state.touchRepeatTarget;
+          Serial.print("M"); Serial.print(index);
+          Serial.print(" final high-side exit backoff: duty=");
+          Serial.print(TOUCH_BACKOFF_DUTY);
+          Serial.print(" counts=");
+          Serial.println(TOUCH_BACKOFF);
+          setDriveCoast(index, -DIR_HIGH, TOUCH_BACKOFF_DUTY);
+          enterHomingPhase(index, HOMING_STEP5_PRECISE_HIGH_BACKOFF);
+        } else {
+          state.touchRepeatIndex++;
+          Serial.print("M"); Serial.print(index);
+          Serial.print(" hard backoff high: duty=");
+          Serial.print(TOUCH_BACKOFF_DUTY);
+          Serial.print(" counts=");
+          Serial.println(TOUCH_BACKOFF);
+          setDriveCoast(index, -DIR_HIGH, TOUCH_BACKOFF_DUTY);
+          enterHomingPhase(index, HOMING_STEP5_PRECISE_HIGH_BACKOFF);
+        }
+      } else if (phaseElapsedMs >= PRECISE_TIMEOUT_MS) {
+        finishHomingMotor(index, false, "precise high timeout");
+      }
+      break;
+
+    case HOMING_STEP5_PRECISE_HIGH_BACKOFF:
+      if (homingMotionReached(index, -DIR_HIGH, TOUCH_BACKOFF) || phaseElapsedMs >= TOUCH_BACKOFF_MS) {
+        stopMotor(index);
+        if (state.touchRepeatIndex >= state.touchRepeatTarget) {
           const long mid = (state.lowEnd + state.highEnd) / 2;
+          Serial.print("M"); Serial.print(index);
+          Serial.print(" midpoint target = ");
+          Serial.println(mid);
           Serial.print("M"); Serial.print(index); Serial.print(" Step 6: Move to midpoint = ");
           Serial.println(mid);
 
@@ -1128,19 +1214,8 @@ void updateHomingMotor(int index) {
           ControlMode[index] = MODE_POS;
           enterHomingPhase(index, HOMING_STEP6_MOVE_MID);
         } else {
-          state.touchRepeatIndex++;
-          setDriveCoast(index, -DIR_HIGH, max((int)PRECISE_DUTY, 15));
-          enterHomingPhase(index, HOMING_STEP5_PRECISE_HIGH_BACKOFF);
+          enterHomingPhase(index, HOMING_STEP5_PRECISE_HIGH_SETTLE);
         }
-      } else if (phaseElapsedMs >= PRECISE_TIMEOUT_MS) {
-        finishHomingMotor(index, false, "precise high timeout");
-      }
-      break;
-
-    case HOMING_STEP5_PRECISE_HIGH_BACKOFF:
-      if (homingMotionReached(index, -DIR_HIGH, TOUCH_BACKOFF) || phaseElapsedMs >= TOUCH_BACKOFF_MS) {
-        stopMotor(index);
-        enterHomingPhase(index, HOMING_STEP5_PRECISE_HIGH_SETTLE);
       }
       break;
 
