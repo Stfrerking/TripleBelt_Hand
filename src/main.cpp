@@ -14,8 +14,8 @@
 // ----------- CAN Message Map ----------- //
 
 // Brain -> Hand
-constexpr uint32_t CAN_ID_CONFIG_CMD      = 0x100;  // requestedConfig
 constexpr uint32_t CAN_ID_HOMING_CMD      = 0x120;  // homing start
+constexpr uint32_t CAN_ID_SET_SERVO_POS   = 0x220;  // servo0,servo1 angle targets (int32 LE)
 
 // NEW: Brain -> Hand (absolute targets, int32 little-endian)
 constexpr uint32_t CAN_ID_SET_POS_01      = 0x210;  // pos0,pos1 (int32 LE)
@@ -96,9 +96,6 @@ volatile bool servoPulseHigh1 = false;
 // ----------- CAN Declaration ----------- //
 FlexCAN_T4<CAN3, RX_SIZE_256, TX_SIZE_16> Can3;
 
-volatile uint8_t requestedConfig = 0;
-volatile bool configChangeRequested = false;
-
 // Homing request flag (set by CAN, executed in loop)
 volatile bool homingRequested = false;
 
@@ -106,7 +103,7 @@ volatile bool homingActive = false;
 
 // Which motors to home when a homing command is received.
 // All listed motors run through the non-blocking 6-step homing state machine.
-constexpr int HOMING_SEQUENCE[] = {1};
+constexpr int HOMING_SEQUENCE[] = {0, 2, 4};
 constexpr int HOMING_SEQUENCE_LEN = (int)(sizeof(HOMING_SEQUENCE) / sizeof(HOMING_SEQUENCE[0]));
 
 // ----------- Global ROM limits for Motor Limits ----------- //
@@ -121,6 +118,10 @@ const int motorSEN[6]   = {MOTOR0_SEN, MOTOR1_SEN, MOTOR2_SEN, MOTOR3_SEN, MOTOR
 
 // NEW: absolute position targets received from Brain (raw, unclamped for now)
 volatile int32_t posTarget[6] = {0,0,0,0,0,0};
+
+// Servo angle targets received from Brain. Values are clamped in setServoAngle().
+volatile int32_t servoTargetDeg[2] = {135, 135};
+volatile bool servoTargetsUpdated = false;
 
 // NEW: flags for safe printing outside ISR
 volatile bool posTargetsUpdated = false;
@@ -274,15 +275,10 @@ Teensy_PWM* motorPwmB[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr
 // vREF PWM object
 Teensy_PWM* vrefPwm = nullptr;
 
-// Declaration for finger configurations driven by servos
-enum HandState { CONFIG_1, CONFIG_2, CONFIG_3, CONFIG_4 };
-HandState currentState = CONFIG_1;
-
 // ----------- Function declarations -----------
 void handleCAN(const CAN_message_t &msg);
 void sendEncoderPositions();
 void sendRangeOfMotion();
-void handleState();
 void printEncoderData();
 void printMotorDiagnostics();
 void printPositionControllerDiagnostics();
@@ -298,7 +294,7 @@ void servoISR0();
 void servoISR1();
 void setServoPulseUs(uint8_t servoIndex, uint32_t us);
 void setServoAngle(uint8_t servoIndex, float deg);
-void applyServoState(HandState state);
+void applyServoTargets();
 static inline uint16_t dutyByteToLevel16(uint8_t dutyByte);
 static inline void setMotorDutyByte(Teensy_PWM* pwm, uint8_t dutyByte);
 void setVrefDuty(int dutyByte);
@@ -395,7 +391,7 @@ void setup() {
   interrupts();
 
   sendRangeOfMotion();
-  handleState();
+  applyServoTargets();
 }
 
 void loop() {
@@ -439,9 +435,11 @@ for (int i = 0; i < 6; i++) {
   }
 }
 
-  if (configChangeRequested) {
-    configChangeRequested = false;
-    handleState();
+  if (servoTargetsUpdated) {
+    noInterrupts();
+    servoTargetsUpdated = false;
+    interrupts();
+    applyServoTargets();
   }
 
   static unsigned long lastPrint = 0;
@@ -463,17 +461,18 @@ void handleCAN(const CAN_message_t &msg) {
   switch (msg.id) {
 
 
-    case CAN_ID_CONFIG_CMD: {
-      if (msg.len >= 1) {
-        requestedConfig = msg.buf[0];
-        configChangeRequested = true;
+    case CAN_ID_HOMING_CMD: {
+      if (msg.len == 1 && msg.buf[0] == 1) {
+        homingRequested = true;
       }
       break;
     }
 
-    case CAN_ID_HOMING_CMD: {
-      if (msg.len == 1 && msg.buf[0] == 1) {
-        homingRequested = true;
+    case CAN_ID_SET_SERVO_POS: {
+      if (msg.len == 8) {
+        servoTargetDeg[0] = unpack_i32_le(&msg.buf[0]);
+        servoTargetDeg[1] = unpack_i32_le(&msg.buf[4]);
+        servoTargetsUpdated = true;
       }
       break;
     }
@@ -511,51 +510,6 @@ void handleCAN(const CAN_message_t &msg) {
     default:
       break;
   }
-}
-
-void handleState() {
-  HandState newState;
-
-  switch (requestedConfig) {
-    case 0: newState = CONFIG_1; break;
-    case 1: newState = CONFIG_2; break;
-    case 2: newState = CONFIG_3; break;
-    case 3: newState = CONFIG_4; break;
-    default:
-      Serial.print("Ignoring invalid requestedConfig: ");
-      Serial.println(requestedConfig);
-      return;
-  }
-
-  if (newState == currentState) {
-    applyServoState(currentState);
-    return;
-  }
-
-  currentState = newState;
-
-  Serial.print("Transitioned to state: ");
-  Serial.println(currentState);
-
-  switch (currentState) {
-    case CONFIG_1:
-      Serial.println("State 1: One-sided Grip");
-      break;
-
-    case CONFIG_2:
-      Serial.println("State 2: Pinch Grip");
-      break;
-
-    case CONFIG_3:
-      Serial.println("State 3: Claw Grip");
-      break;
-
-    case CONFIG_4:
-      Serial.println("State 4: Coffee Cup Grip");
-      break;
-  }
-
-  applyServoState(currentState);
 }
 
 void controlMotor(int index) {
@@ -641,25 +595,17 @@ void setServoAngle(uint8_t servoIndex, float deg) {
   setServoPulseUs(servoIndex, us);
 }
 
-void applyServoState(HandState state) {
-  switch (state) {
-    case CONFIG_1:
-      setServoAngle(0, 5.0f);
-      setServoAngle(1, 210.0f);
-      break;
-    case CONFIG_2:
-      setServoAngle(0, 102.0f);
-      setServoAngle(1, 98.0f);
-      break;
-    case CONFIG_3:
-      setServoAngle(0, 140.0f);
-      setServoAngle(1, 45.0f);
-      break;
-    case CONFIG_4:
-      setServoAngle(0, 210.0f);
-      setServoAngle(1, 5.0f);
-      break;
-  }
+void applyServoTargets() {
+  int32_t target0;
+  int32_t target1;
+
+  noInterrupts();
+  target0 = servoTargetDeg[0];
+  target1 = servoTargetDeg[1];
+  interrupts();
+
+  setServoAngle(0, (float)target0);
+  setServoAngle(1, (float)target1);
 }
 
 static inline int32_t unpack_i32_le(const uint8_t *b) {

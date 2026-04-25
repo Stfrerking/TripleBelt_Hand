@@ -13,8 +13,8 @@ FlexCAN_T4<CAN3, RX_SIZE_256, TX_SIZE_16> Can0;
 
 // ----------- CAN Message Map (must match Hand) ----------- //
 // Brain -> Hand
-constexpr uint32_t CAN_ID_CONFIG_CMD   = 0x100;  // requestedConfig
 constexpr uint32_t CAN_ID_HOMING_CMD   = 0x120;  // homing start
+constexpr uint32_t CAN_ID_SET_SERVO_POS = 0x220; // servo0, servo1 angle targets (int32 LE)
 
 constexpr uint32_t CAN_ID_SET_POS_01   = 0x210;  // pos0, pos1 (int32 LE)
 constexpr uint32_t CAN_ID_SET_POS_23   = 0x211;  // pos2, pos3
@@ -27,14 +27,12 @@ constexpr uint32_t CAN_ID_ROM_BASE     = 0x130;  // + motor index (0..5)
 // ----------- IO Pins ----------- //
 const int JOY_X_PIN        = 22;  // A0
 const int JOY_Y_PIN        = 23;  // A1
-const int BUTTON_PIN       = 1;  // Config cycle button
+const int BUTTON_PIN       = 1;  // Servo preset cycle button
 const int HOME_BUTTON_PIN  = 7;  // Button for homing
 
 // ----------- State ----------- //
 bool lastButtonState      = false;
 bool lastHomeButtonState  = false;
-
-uint8_t currentConfig = 0;  // 0..3
 
 // Encoder + ROM data from Hand
 int32_t encoderPositions[6] = {0};
@@ -43,14 +41,33 @@ int32_t highROM[6]          = {0};
 
 // Absolute target positions to send to Hand
 int32_t posTarget[6] = {0};
+struct ServoPreset {
+  const char *name;
+  int32_t servoAnglesDeg[2];
+};
+
+const ServoPreset SERVO_PRESETS[] = {
+  {"One-sided Grip", {5, 210}},
+  {"Pinch Grip", {102, 98}},
+  {"Claw Grip", {140, 45}},
+  {"Coffee Cup Grip", {210, 5}},
+};
+constexpr uint8_t SERVO_PRESET_COUNT = sizeof(SERVO_PRESETS) / sizeof(SERVO_PRESETS[0]);
+
+uint8_t currentServoPreset = 0;
+int32_t servoTargetDeg[2] = {
+  SERVO_PRESETS[0].servoAnglesDeg[0],
+  SERVO_PRESETS[0].servoAnglesDeg[1],
+};
 
 unsigned long lastPrintTime         = 0;
 const unsigned long printIntervalMs = 1000;
 
 // ----------- Function Declarations ----------- //
-void sendConfig();
 void sendHomingRequest();
 void sendPositionTargets();
+void applyServoPreset(uint8_t presetIndex);
+void sendServoPositions();
 
 // Joystick → delta counts per loop (VERY conservative to start)
 int32_t joystickToDelta(int raw) {
@@ -118,7 +135,7 @@ void setup() {
   pinMode(HOME_BUTTON_PIN, INPUT_PULLUP);
 
   Serial.println("Brain: Absolute position controller ready");
-  sendConfig();
+  sendServoPositions();
 }
 
 void loop() {
@@ -131,8 +148,8 @@ void loop() {
   bool homeBtn = !digitalRead(HOME_BUTTON_PIN);
 
   if (btn && !lastButtonState) {
-    currentConfig = (currentConfig + 1) % 4;
-    sendConfig();
+    currentServoPreset = (currentServoPreset + 1) % SERVO_PRESET_COUNT;
+    applyServoPreset(currentServoPreset);
   }
   lastButtonState = btn;
 
@@ -152,6 +169,7 @@ void loop() {
   }
 
   sendPositionTargets();
+  sendServoPositions();
 
   // ----------- Debug ----------- //
   unsigned long now = millis();
@@ -168,20 +186,41 @@ void loop() {
       Serial.print(encoderPositions[i]); Serial.print(" ");
     }
     Serial.println();
+
+    Serial.print("Servo Targets Deg: ");
+    Serial.print(SERVO_PRESETS[currentServoPreset].name);
+    Serial.print(": ");
+    Serial.print(servoTargetDeg[0]); Serial.print(" ");
+    Serial.println(servoTargetDeg[1]);
   }
 
   delay(10);
 }
 
 // ----------- CAN Send Helpers ----------- //
-void sendConfig() {
+void applyServoPreset(uint8_t presetIndex) {
+  if (presetIndex >= SERVO_PRESET_COUNT) return;
+
+  servoTargetDeg[0] = SERVO_PRESETS[presetIndex].servoAnglesDeg[0];
+  servoTargetDeg[1] = SERVO_PRESETS[presetIndex].servoAnglesDeg[1];
+  sendServoPositions();
+
+  Serial.print("Servo Preset Sent: ");
+  Serial.print(SERVO_PRESETS[presetIndex].name);
+  Serial.print(" (");
+  Serial.print(servoTargetDeg[0]);
+  Serial.print(", ");
+  Serial.print(servoTargetDeg[1]);
+  Serial.println(")");
+}
+
+void sendServoPositions() {
   CAN_message_t msg;
-  msg.id = CAN_ID_CONFIG_CMD;
-  msg.len = 1;
-  msg.buf[0] = currentConfig;
+  msg.id = CAN_ID_SET_SERVO_POS;
+  msg.len = 8;
+  pack_i32_le(&msg.buf[0], servoTargetDeg[0]);
+  pack_i32_le(&msg.buf[4], servoTargetDeg[1]);
   Can0.write(msg);
-  Serial.print("Config Request Sent: ");
-  Serial.println(currentConfig);
 }
 
 void sendHomingRequest() {
