@@ -23,6 +23,7 @@ constexpr uint32_t CAN_ID_SET_POS_45   = 0x212;  // pos4, pos5
 // Hand -> Brain
 constexpr uint32_t CAN_ID_ENCODER_BASE = 0x110;  // + motor index (0..5)
 constexpr uint32_t CAN_ID_ROM_BASE     = 0x130;  // + motor index (0..5)
+constexpr uint32_t CAN_ID_CURRENT_BASE = 0x140;  // + motor index (0..5), current in mA (int32 LE)
 
 // ----------- IO Pins ----------- //
 const int JOY_X_PIN        = 22;  // A0
@@ -38,6 +39,7 @@ bool lastHomeButtonState  = false;
 int32_t encoderPositions[6] = {0};
 int32_t lowROM[6]           = {0};
 int32_t highROM[6]          = {0};
+int32_t motorCurrents_mA[6] = {0};
 
 // Absolute target positions to send to Hand
 int32_t posTarget[6] = {0};
@@ -121,6 +123,13 @@ void handleCAN(const CAN_message_t &msg) {
     highROM[i] = unpack_i32_le(&msg.buf[4]);
     return;
   }
+
+  // Motor currents: IDs 0x140 .. 0x145 (mA as int32 LE)
+  if (msg.id >= CAN_ID_CURRENT_BASE && msg.id < CAN_ID_CURRENT_BASE + 6 && msg.len == 4) {
+    int i = msg.id - CAN_ID_CURRENT_BASE;
+    motorCurrents_mA[i] = unpack_i32_le(msg.buf);
+    return;
+  }
 }
 
 void setup() {
@@ -184,6 +193,12 @@ void loop() {
     Serial.print("Enc Positions: ");
     for (int i = 0; i < 6; i++) {
       Serial.print(encoderPositions[i]); Serial.print(" ");
+    }
+    Serial.println();
+
+    Serial.print("Motor Currents A: ");
+    for (int i = 0; i < 6; i++) {
+      Serial.print(motorCurrents_mA[i] / 1000.0f, 3); Serial.print(" ");
     }
     Serial.println();
 
@@ -251,4 +266,3 @@ void sendPositionTargets() {
   pack_i32_le(m.buf + 4, posTarget[5]);
   Can0.write(m);
 }
-

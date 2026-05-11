@@ -25,6 +25,7 @@ constexpr uint32_t CAN_ID_SET_POS_45      = 0x212;  // pos4,pos5
 // Hand -> Brain
 constexpr uint32_t CAN_ID_ENCODER_BASE    = 0x110;  // + motor index
 constexpr uint32_t CAN_ID_ROM_BASE        = 0x130;  // + motor index
+constexpr uint32_t CAN_ID_CURRENT_BASE    = 0x140;  // + motor index, current in mA (int32 LE)
 
 // ----------- Encoder Pins (Hardware Quadrature) ----------- //
 #define ENC0_A 0
@@ -103,7 +104,7 @@ volatile bool homingActive = false;
 
 // Which motors to home when a homing command is received.
 // All listed motors run through the non-blocking 6-step homing state machine.
-constexpr int HOMING_SEQUENCE[] = {0, 2, 4};
+constexpr int HOMING_SEQUENCE[] = {1};
 constexpr int HOMING_SEQUENCE_LEN = (int)(sizeof(HOMING_SEQUENCE) / sizeof(HOMING_SEQUENCE[0]));
 
 // ----------- Global ROM limits for Motor Limits ----------- //
@@ -170,8 +171,8 @@ uint8_t posMinDuty[6]        = { 50, 115, 50, 115, 50, 115 };   // overcome stat
 // Stall detection thresholds [Amps]
 // NOTE: Drive–Brake tends to produce higher average IPROPI/current than Drive–Coast at the same mechanical load.
 // So we allow separate thresholds for BLUNT (drive–coast) vs PRECISE (drive–brake).
-float homingStallA_blunt[6]   = { 0.20f, 0.30f, 0.20f, 0.15f, 0.20f, 0.15f };
-float homingStallA_precise[6] = { 0.30f, 0.40f, 0.30f, 0.20f, 0.30f, 0.20f };
+float homingStallA_blunt[6]   = { 0.20f, 0.50f, 0.20f, 0.15f, 0.20f, 0.15f };
+float homingStallA_precise[6] = { 0.30f, 0.50f, 0.30f, 0.20f, 0.30f, 0.20f };
 
 // Ignore current sensing for a short time after entering drive–brake to avoid immediate false "stall" due to braking current spikes.
 uint32_t homingBrakeBlankMs[6] = { 100, 100, 100, 100, 100, 100 };
@@ -194,7 +195,7 @@ uint32_t homingBluntTimeoutHighMs[6] = { 12000, 20000, 12000, 20000, 12000, 2000
 
 
 // Blunt seek (drive–coast)
-uint8_t homingBluntDuty[6] = { 140, 160, 140, 160, 140, 160 };
+uint8_t homingBluntDuty[6] = { 140, 140, 140, 160, 140, 160 };
 
 // Backoff distances [encoder counts]
 int homingBluntBackoffCounts[6] = { 3000, 5000, 3000, 5000, 3000, 5000 };
@@ -279,6 +280,7 @@ Teensy_PWM* vrefPwm = nullptr;
 void handleCAN(const CAN_message_t &msg);
 void sendEncoderPositions();
 void sendRangeOfMotion();
+void sendMotorCurrents();
 void printEncoderData();
 void printMotorDiagnostics();
 void printPositionControllerDiagnostics();
@@ -301,6 +303,8 @@ void setVrefDuty(int dutyByte);
 static inline float readMotorCurrentA(int index);
 static inline void setDriveCoast(int index, int dir, uint8_t duty);
 static inline void setDriveBrake(int index, int dir, uint8_t driveDuty);
+static inline bool homingUsesDriveCoast(int index);
+static inline void setHomingSeekDrive(int index, int dir, uint8_t duty);
 static inline int32_t unpack_i32_le(const uint8_t *b);
 static inline void pack_i32_le(uint8_t *b, int32_t v);
 static inline void enterPosModeHold(int index);
@@ -411,6 +415,7 @@ void loop() {
   static unsigned long lastSend = 0;
   if (millis() - lastSend >= 100) {
     sendEncoderPositions();
+    sendMotorCurrents();
     lastSend = millis();
   }
 
@@ -609,10 +614,12 @@ void applyServoTargets() {
 }
 
 static inline int32_t unpack_i32_le(const uint8_t *b) {
-  return (int32_t)b[0]
-       | ((int32_t)b[1] << 8)
-       | ((int32_t)b[2] << 16)
-       | ((int32_t)b[3] << 24);
+  return (int32_t)(
+    ((uint32_t)b[0])        |
+    ((uint32_t)b[1] << 8)   |
+    ((uint32_t)b[2] << 16)  |
+    ((uint32_t)b[3] << 24)
+  );
 }
 
 static inline void pack_i32_le(uint8_t *b, int32_t v) {
@@ -688,6 +695,18 @@ static inline void setDriveBrake(int index, int dir, uint8_t driveDuty) {
     PWM_A[index] = brakeDuty;
   }
   controlMotor(index);
+}
+
+static inline bool homingUsesDriveCoast(int index) {
+  return index == 1 || index == 3 || index == 5;
+}
+
+static inline void setHomingSeekDrive(int index, int dir, uint8_t duty) {
+  if (homingUsesDriveCoast(index)) {
+    setDriveCoast(index, dir, duty);
+  } else {
+    setDriveBrake(index, dir, duty);
+  }
 }
 
 #if 0
@@ -926,6 +945,7 @@ void updateHomingMotor(int index) {
   const float    STALL_BLUNT_A     = homingStallA_blunt[index];
   const float    STALL_PRECISE_A   = homingStallA_precise[index];
   const uint32_t BRAKE_BLANK_MS    = homingBrakeBlankMs[index];
+  const uint32_t SEEK_BLANK_MS     = homingUsesDriveCoast(index) ? 0 : BRAKE_BLANK_MS;
   const uint32_t STALL_DEBOUNCE_MS = homingStallDebounceMs[index];
   const uint32_t SAMPLE_MS         = homingSampleMs[index];
 
@@ -963,7 +983,7 @@ void updateHomingMotor(int index) {
       if (homingMotionReached(index, +1, UNSTICK_MIN_COUNTS)) {
         stopMotor(index);
         Serial.print("M"); Serial.print(index); Serial.println(" Step 2: Blunt Low");
-        setDriveBrake(index, DIR_LOW, BLUNT_DUTY);
+        setHomingSeekDrive(index, DIR_LOW, BLUNT_DUTY);
         enterHomingPhase(index, HOMING_STEP2_BLUNT_LOW);
       } else if (phaseElapsedMs >= UNSTICK_MS) {
         stopMotor(index);
@@ -976,7 +996,7 @@ void updateHomingMotor(int index) {
       if (homingMotionReached(index, -1, UNSTICK_MIN_COUNTS)) {
         stopMotor(index);
         Serial.print("M"); Serial.print(index); Serial.println(" Step 2: Blunt Low");
-        setDriveBrake(index, DIR_LOW, BLUNT_DUTY);
+        setHomingSeekDrive(index, DIR_LOW, BLUNT_DUTY);
         enterHomingPhase(index, HOMING_STEP2_BLUNT_LOW);
       } else if (phaseElapsedMs >= UNSTICK_MS) {
         finishHomingMotor(index, false, "could not unstick");
@@ -985,7 +1005,7 @@ void updateHomingMotor(int index) {
 
     case HOMING_STEP2_BLUNT_LOW:
       if (homingStallDetectedNonBlocking(index, STALL_BLUNT_A, STALL_DEBOUNCE_MS, SAMPLE_MS,
-                                         homingBluntTimeoutLowMs[index], BRAKE_BLANK_MS)) {
+                                         homingBluntTimeoutLowMs[index], SEEK_BLANK_MS)) {
         stopMotor(index);
         Serial.print("M"); Serial.print(index);
         Serial.print(" blunt low hit @ ");
@@ -1001,14 +1021,14 @@ void updateHomingMotor(int index) {
       if (homingMotionReached(index, -DIR_LOW, BLUNT_BACKOFF) || phaseElapsedMs >= BLUNT_BACKOFF_MS) {
         stopMotor(index);
         Serial.print("M"); Serial.print(index); Serial.println(" Step 3: Precise Low");
-        setDriveBrake(index, DIR_LOW, PRECISE_DUTY);
+        setHomingSeekDrive(index, DIR_LOW, PRECISE_DUTY);
         enterHomingPhase(index, HOMING_STEP3_PRECISE_LOW_DRIVE);
       }
       break;
 
     case HOMING_STEP3_PRECISE_LOW_DRIVE:
       if (homingStallDetectedNonBlocking(index, STALL_PRECISE_A, STALL_DEBOUNCE_MS, SAMPLE_MS,
-                                         PRECISE_TIMEOUT_MS, BRAKE_BLANK_MS)) {
+                                         PRECISE_TIMEOUT_MS, SEEK_BLANK_MS)) {
         stopMotor(index);
         state.lowSamples[state.touchRepeatIndex] = encoders[index]->read();
         Serial.print("M"); Serial.print(index);
@@ -1056,7 +1076,7 @@ void updateHomingMotor(int index) {
         stopMotor(index);
         if (state.touchRepeatIndex >= state.touchRepeatTarget) {
           Serial.print("M"); Serial.print(index); Serial.println(" Step 4: Blunt High");
-          setDriveBrake(index, DIR_HIGH, BLUNT_DUTY);
+          setHomingSeekDrive(index, DIR_HIGH, BLUNT_DUTY);
           enterHomingPhase(index, HOMING_STEP4_BLUNT_HIGH);
         } else {
           enterHomingPhase(index, HOMING_STEP3_PRECISE_LOW_SETTLE);
@@ -1066,14 +1086,14 @@ void updateHomingMotor(int index) {
 
     case HOMING_STEP3_PRECISE_LOW_SETTLE:
       if (phaseElapsedMs >= HOMING_TOUCH_SETTLE_MS) {
-        setDriveBrake(index, DIR_LOW, PRECISE_DUTY);
+        setHomingSeekDrive(index, DIR_LOW, PRECISE_DUTY);
         enterHomingPhase(index, HOMING_STEP3_PRECISE_LOW_DRIVE);
       }
       break;
 
     case HOMING_STEP4_BLUNT_HIGH:
       if (homingStallDetectedNonBlocking(index, STALL_BLUNT_A, STALL_DEBOUNCE_MS, SAMPLE_MS,
-                                         homingBluntTimeoutHighMs[index], BRAKE_BLANK_MS)) {
+                                         homingBluntTimeoutHighMs[index], SEEK_BLANK_MS)) {
         stopMotor(index);
         Serial.print("M"); Serial.print(index);
         Serial.print(" blunt high hit @ ");
@@ -1090,14 +1110,14 @@ void updateHomingMotor(int index) {
         stopMotor(index);
         Serial.print("M"); Serial.print(index); Serial.println(" Step 5: Precise High");
         state.touchRepeatIndex = 0;
-        setDriveBrake(index, DIR_HIGH, PRECISE_DUTY);
+        setHomingSeekDrive(index, DIR_HIGH, PRECISE_DUTY);
         enterHomingPhase(index, HOMING_STEP5_PRECISE_HIGH_DRIVE);
       }
       break;
 
     case HOMING_STEP5_PRECISE_HIGH_DRIVE:
       if (homingStallDetectedNonBlocking(index, STALL_PRECISE_A, STALL_DEBOUNCE_MS, SAMPLE_MS,
-                                         PRECISE_TIMEOUT_MS, BRAKE_BLANK_MS)) {
+                                         PRECISE_TIMEOUT_MS, SEEK_BLANK_MS)) {
         stopMotor(index);
         state.highSamples[state.touchRepeatIndex] = encoders[index]->read();
         Serial.print("M"); Serial.print(index);
@@ -1167,7 +1187,7 @@ void updateHomingMotor(int index) {
 
     case HOMING_STEP5_PRECISE_HIGH_SETTLE:
       if (phaseElapsedMs >= HOMING_TOUCH_SETTLE_MS) {
-        setDriveBrake(index, DIR_HIGH, PRECISE_DUTY);
+        setHomingSeekDrive(index, DIR_HIGH, PRECISE_DUTY);
         enterHomingPhase(index, HOMING_STEP5_PRECISE_HIGH_DRIVE);
       }
       break;
@@ -1288,6 +1308,19 @@ void sendRangeOfMotion() {
 
     pack_i32_le(&msg.buf[0], (int32_t)lowROM[i]);
     pack_i32_le(&msg.buf[4], (int32_t)highROM[i]);
+
+    Can3.write(msg);
+  }
+}
+
+void sendMotorCurrents() {
+  for (int i = 0; i < 6; i++) {
+    CAN_message_t msg;
+    msg.id = CAN_ID_CURRENT_BASE + i;
+    msg.len = 4;
+
+    const int32_t current_mA = (int32_t)(readMotorCurrentA(i) * 1000.0f);
+    pack_i32_le(msg.buf, current_mA);
 
     Can3.write(msg);
   }
@@ -1599,4 +1632,3 @@ void updatePositionController(int index, float dt_s) {
   Serial.println(mid);
 }
 #endif
-
