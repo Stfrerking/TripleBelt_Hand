@@ -1,10 +1,21 @@
+import subprocess
 import tkinter as tk
 
+CAN_INTERFACE = "can0"
+CAN_POSITION_IDS = (0x210, 0x211, 0x212)
+METACARPAL_MOTORS = (0, 2, 4)
+CARRIAGE_MOTORS = (1, 3, 5)
+SLIDER_UPDATE_MS = 50
+SERVO_MIN_DEG = 0.0
+SERVO_MAX_DEG = 270.0
+
 # ---- Fake data (for now) ----
-motor_positions = [0, 100, 200, 300, 400, 500]
+motor_positions = [0, 0, 0, 0, 0, 0]
+motor_position_targets = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 motor_currents = [0.10, 0.20, 0.15, 0.30, 0.25, 0.18]
 
 servo_positions = [90, 90]
+servo_position_targets = [90.0, 90.0]
 current_config = 1
 
 CONFIG_PRESETS = {
@@ -15,6 +26,42 @@ CONFIG_PRESETS = {
 }
 
 # ---- Functions ----
+def pack_i32_le(value):
+    return int(value).to_bytes(4, byteorder="little", signed=True)
+
+
+def clamp(value, lo, hi):
+    return max(lo, min(hi, value))
+
+
+def send_position_targets():
+    for frame_index, can_id in enumerate(CAN_POSITION_IDS):
+        first_motor = frame_index * 2
+        payload = (
+            pack_i32_le(motor_positions[first_motor])
+            + pack_i32_le(motor_positions[first_motor + 1])
+        )
+        frame = f"{can_id:03X}#{payload.hex().upper()}"
+
+        try:
+            subprocess.run(
+                ["cansend", CAN_INTERFACE, frame],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            print("cansend is not installed or not on PATH")
+            return False
+        except subprocess.CalledProcessError as exc:
+            error_text = exc.stderr.strip() or exc.stdout.strip() or str(exc)
+            print(f"Failed to send position CAN frame {frame}: {error_text}")
+            return False
+
+    print(f"Position targets sent: {motor_positions}")
+    return True
+
+
 def send_target(motor_index):
     try:
         target = int(entry_vars[motor_index].get())
@@ -23,27 +70,100 @@ def send_target(motor_index):
         return
 
     print(f"Motor {motor_index} target set to {target}")
+    motor_position_targets[motor_index] = float(target)
     motor_positions[motor_index] = target
+    send_position_targets()
     update_display()
+
+
+def update_targets_from_sliders():
+    now_ms = int(root.tk.call("clock", "milliseconds"))
+    dt_s = (now_ms - update_targets_from_sliders.last_ms) / 1000.0
+    update_targets_from_sliders.last_ms = now_ms
+
+    motor_targets_changed = False
+    display_changed = False
+    slider_motor_groups = (
+        (0, METACARPAL_MOTORS),
+        (1, CARRIAGE_MOTORS),
+    )
+
+    for slider_index, motor_indices in slider_motor_groups:
+        rate_counts_per_s = slider_vars[slider_index].get()
+        if abs(rate_counts_per_s) < 0.001:
+            continue
+
+        delta_counts = rate_counts_per_s * dt_s
+        for motor_index in motor_indices:
+            motor_position_targets[motor_index] += delta_counts
+            motor_positions[motor_index] = int(round(motor_position_targets[motor_index]))
+            entry_vars[motor_index].set(str(motor_positions[motor_index]))
+        motor_targets_changed = True
+        display_changed = True
+
+    servo_rate_deg_per_s = slider_vars[2].get()
+    if abs(servo_rate_deg_per_s) >= 0.001:
+        delta_deg = servo_rate_deg_per_s * dt_s
+        servo_position_targets[0] = clamp(
+            servo_position_targets[0] + delta_deg, SERVO_MIN_DEG, SERVO_MAX_DEG
+        )
+        servo_position_targets[1] = clamp(
+            servo_position_targets[1] - delta_deg, SERVO_MIN_DEG, SERVO_MAX_DEG
+        )
+
+        for servo_index in range(2):
+            servo_positions[servo_index] = servo_position_targets[servo_index]
+            servo_vars[servo_index].set(f"{servo_positions[servo_index]:.1f}")
+        display_changed = True
+
+    if motor_targets_changed:
+        send_position_targets()
+
+    if display_changed:
+        update_display()
+
+    root.after(SLIDER_UPDATE_MS, update_targets_from_sliders)
 
 
 def send_servo(servo_index):
     try:
-        target = int(servo_vars[servo_index].get())
+        target = float(servo_vars[servo_index].get())
     except ValueError:
         print(f"Servo {servo_index}: invalid input")
         return
 
+    target = clamp(target, SERVO_MIN_DEG, SERVO_MAX_DEG)
     print(f"Servo {servo_index} set to {target}")
+    servo_position_targets[servo_index] = target
     servo_positions[servo_index] = target
+    servo_vars[servo_index].set(f"{target:.1f}")
     update_display()
 
 
 def home_all():
-    print("Homing all motors")
+    try:
+        subprocess.run(
+            ["cansend", CAN_INTERFACE, "120#01"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        print("cansend is not installed or not on PATH")
+        homing_label.config(text="cansend not found")
+        return
+    except subprocess.CalledProcessError as exc:
+        error_text = exc.stderr.strip() or exc.stdout.strip() or str(exc)
+        print(f"Failed to send homing CAN frame: {error_text}")
+        homing_label.config(text="Homing send failed")
+        return
+
+    print(f"Homing CAN frame sent: {CAN_INTERFACE} 120#01")
     for i in range(6):
+        motor_position_targets[i] = 0.0
         motor_positions[i] = 0
-    homing_label.config(text="Homing flag sent!")
+        entry_vars[i].set("0")
+    homing_label.config(text="Homing command sent")
     update_display()
 
 
@@ -61,6 +181,7 @@ def apply_config(config_number):
     print(f"Changed to Config {config_number}: {preset['name']}")
 
     for i, angle in enumerate(preset["servo_angles"]):
+        servo_position_targets[i] = angle
         servo_positions[i] = angle
         if i < len(servo_vars):
             servo_vars[i].set(f"{angle:.1f}")
@@ -178,7 +299,7 @@ snap_frame = tk.Frame(right_panel, bg=BG)
 snap_frame.grid(row=2, column=0, padx=20, pady=(10, 0), sticky="w")
 tk.Checkbutton(
     snap_frame,
-    text="Snap sliders to zero on release (recommended)",
+    text="Snap rate sliders to zero on release",
     variable=snap_var,
     bg=BG,
     fg=FG,
@@ -192,8 +313,8 @@ ctrl = tk.LabelFrame(right_panel, text="Drive Command", font=("Arial", 10, "bold
 ctrl.grid(row=3, column=0, padx=20, pady=(6, 4), sticky="w")
 
 SLIDER_DEFS = [
-    ("Metacarpal (pos/s)", -2500, 2500),
-    ("Carriage (pos/s)", -10000, 10000),
+    ("Metacarpal (counts/s)", -2500, 2500),
+    ("Carriage (counts/s)", -10000, 10000),
     ("Servos (deg/s)", -15, 15),
 ]
 
@@ -277,6 +398,8 @@ for i in range(2):
 # ---- Initialize display ----
 apply_config(current_config)
 update_display()
+update_targets_from_sliders.last_ms = int(root.tk.call("clock", "milliseconds"))
+root.after(SLIDER_UPDATE_MS, update_targets_from_sliders)
 
 # ---- Run ----
 root.mainloop()
